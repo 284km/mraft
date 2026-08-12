@@ -76,7 +76,7 @@ longer depends on whether someone redirected it.
 
 ---
 
-## P4 — one `int` cannot say why a read returned nothing
+## P4 — one `int` could not say why a read returned nothing (half fixed, mere v0.1.226)
 
 `tcp_read` returns what `read(2)` returned: a count, `0` at end of stream, and
 `-1` for everything else. With `SO_RCVTIMEO` set, "everything else" covers both
@@ -99,8 +99,31 @@ removed every deadline from the socket layer, and a read either brings a message
 or ends the connection. The question comes back when a node needs to tell a peer
 that is *slow* from one that is *gone* — which is M2's problem, not M1's.
 
-**Status:** open, and the most interesting item here. It is the general question
-of how a capability reports *why* it failed, not just *that* it did.
+**The concrete case is fixed upstream.** `tcp_read` now distinguishes its failures,
+staying negative so every `< 0` check is unaffected:
+
+```
+ -1   nothing arrived before the deadline
+ -2   the connection is gone
+ -3   anything else
+```
+
+`0` still means the peer closed cleanly, which is information rather than failure.
+`scripts/tcp_read_codes.sh` in mere produces all three rather than describing them —
+including the third, which needs a peer that aborts with data still unread in its own
+receive queue, because that is what makes `close()` send RST instead of FIN.
+
+M5 does not use it: making time a message removed every deadline from this program's
+socket layer, so a read here either brings a message or ends the connection. The fix
+is for the next program with a deadline, and for `mdns`, which has one.
+
+**Status:** the general question is still open, and a convention about negative
+integers is not an answer to it. An `extern fn` is C-shaped, so a capability that can
+fail four ways has to encode them in the return type it was given — an `int` — and the
+caller reconstructs a meaning that should have been handed over. What a capability
+returning `Ok of t | TimedOut | Gone | Failed of int` would cost at the FFI boundary is
+a design question, and one worth deciding before the next capability is added rather
+than after.
 
 ---
 
