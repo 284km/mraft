@@ -9,7 +9,7 @@ Fixed items name the version that fixed them.
 
 ---
 
-## P1 — the reserved-name warning does not look at type names
+## P1 — the reserved-name warning did not look at type names (fixed in mere v0.1.223)
 
 `type wait = ...` compiles to C containing `typedef struct wait wait;`, which
 collides with `union wait` in `<sys/wait.h>`:
@@ -24,11 +24,18 @@ runs for `type` declarations, so a type name gets no warning and the failure
 surfaces from clang instead — the same "documented builtin failing at the wrong
 layer" shape as the `print_int` bug in v0.1.190.
 
-`wait` is also not on the list, which is a second, smaller thing: the list covers
+`wait` was also not on the list, which was a second, smaller thing: it covered
 `<stdlib.h>`, `<math.h>`, `<time.h>` and POSIX I/O, but not `<sys/wait.h>`.
 
-**Status:** open. Worked around by not naming a type `wait`, which is a fine
-thing to do and a poor thing to have to know.
+Fixed upstream: the check now runs for `type` declarations too, on the name itself,
+and a list of the struct tags the emitted headers bring in was added — `wait`, `tm`,
+`timeval`, `stat`, `dirent`, `sockaddr`, `addrinfo`, `termios`, `sigaction`, `fd_set`
+and family. It fires on both paths, the compiler's and the editor's; it went in on
+the first only and the test through `Pipeline.diagnostics` caught that.
+
+**Status:** closed. A `type` lowers to `typedef struct <name> <name>;`, which claims
+C's tag namespace *and* its ordinary one — so the collision was with `union wait` and
+with the `wait()` declared beside it, both at once.
 
 ---
 
@@ -97,7 +104,7 @@ of how a capability reports *why* it failed, not just *that* it did.
 
 ---
 
-## P5 — the Send check asks for a type that inference has not reached yet
+## P5 — the capture check did not look inside a constructor pattern (fixed in mere v0.1.224)
 
 Spawning a thread that captures a peer's port was refused:
 
@@ -106,18 +113,30 @@ type error: cannot capture `p` of unknown type across a thread boundary
     |     let _ = spawn (fn () -> sender p out buf (0 - 1)) in
 ```
 
-`p` comes from `Cons (p, rest)` where the list is annotated two lines above, and
-it is an `int`. The Send check runs before that annotation has propagated to the
-pattern variable, so it sees an unresolved type variable and refuses rather than
-waiting.
+`p` comes from `Cons (p, rest)` where the list is annotated `int list` two lines
+above. The workaround was to write `let peer_port = (p : int) in` and capture that —
+an ascription carrying no information the program did not already have.
 
-The message is honest about what happened, which is the good part: it says
-"unknown type", not "not Send". But the fix is to write `let peer_port = (p : int)
-in` and capture that instead — an ascription that carries no information the
-program did not already have, added to satisfy the order two passes run in.
+**What this entry said before was wrong**, and the wrong version is worth keeping
+next to the right one. It said the Send check runs before the annotation has
+propagated to the pattern variable: a story about two passes and their order, which
+fit the symptom, sounded like the kind of thing that goes wrong in a compiler, and
+was told **without looking at the code**.
 
-**Status:** open. Every capture in `mraft.mere` that a reader might think is
-redundant is this.
+The types were fully resolved. The capture check's pattern binder handled `P_var` and
+a tuple pattern over a tuple type, and bound the variables of every other shape —
+constructor patterns, record patterns — with **no type at all**, which makes them
+unusable across `spawn` by construction. Nothing was racing; a case was missing.
+
+Fixed upstream in v0.1.224 by decomposing those patterns from the declared payload
+type: the constructor registry knows the type parameters and the payload, and the
+scrutinee's own arguments say what to substitute. Record patterns the same, field by
+field. A payload whose type genuinely is a variable is still refused, and now says
+`of polymorphic type` rather than `of unknown type` — which is the diagnosis I should
+have read in the first place, since it is the message the *other* branch prints.
+
+**Status:** closed. Kept in full because guessing at a mechanism and writing the guess
+down as a finding is the failure mode this file exists to avoid.
 
 ---
 

@@ -1,27 +1,36 @@
-// mraft.mere — a replicated log: three nodes agree on a sequence of commands,
-// and keep agreeing when one of them stops.
+// mraft.mere — Raft: three nodes agree on a sequence of commands, keep agreeing
+// when one of them stops, and tell the client which of its requests landed.
 //
 //   $ mere -c mraft.mere > m.c && clang -O2 m.c -o mraft
 //   $ ./mraft 1 7001 7001 7002 7003    # id, my port, then every port in id order
 //   $ ./mraft 2 7002 7001 7002 7003
 //   $ ./mraft 3 7003 7001 7002 7003
-//   $ printf 'PROP hello\n' | nc 127.0.0.1 7001     # to whichever node is leader
+//   $ printf 'PROP 1 1 hello\n' | nc 127.0.0.1 7001   # client 1, request 1
 //
-// M3: a durable log. Everything Raft requires to survive a crash — the current
-// term, the vote, and every entry — is written and fsynced *before* the node acts
-// on it, so a killed process comes back with what it promised rather than with
-// nothing. M0 established the failure vocabulary, M1 elected a leader, M2 made the
-// cluster agree on a sequence; this is the slice where the agreement outlives the
-// processes that made it.
+// M5, the last slice: everything above plus a client protocol. What the repository
+// set out to handle is handled — silence, a crash, a lost disk, a total restart, a
+// network that drops and duplicates and reorders, and a majority that goes away.
+//
+//   M0  a wait that can end without an answer      heard / timed out / gone
+//   M1  leader election                            terms, randomised timeouts
+//   M2  a replicated log                           consistency check, commit index
+//   M3  durability                                 fsync before acting
+//   M4  an adversarial network                     --chaos <pct>
+//   M5  a client protocol                          the reply waits for the commit
 //
 // The write-ahead log is text, one record per line, in the order things happened:
 //
-//   T <term> <voted-for>          the vote in a term; the last one wins
-//   E <index> <term> <command>    an entry at that index
+//   T <term> <voted-for>                        the vote in a term; the last wins
+//   E <index> <term> <client> <seq> <command>   an entry at that index
 //
-// An `E` at an index the log already has means the entry there was **replaced**,
-// so replay drops everything above it. That is how a follower's truncation is
-// recorded without a truncate syscall: rewriting history is an append.
+// An `E` at an index the log already has means the entry there was **replaced**, so
+// replay drops everything above it. That is how a follower's truncation is recorded
+// without a truncate syscall: rewriting history is an append.
+//
+// A client sends `PROP <client-id> <seq> <command>` and gets one of `OK <index>`,
+// `DUP <seq>`, `NOTLEADER <id>` or `LOST <index>`. The sequence number is what makes
+// a retry safe: a lost reply forces every client to resend, and every node
+// de-duplicates at apply time from the same log.
 //
 // ---- the shape this program is built around --------------------------------
 //
@@ -756,14 +765,8 @@ let rec start_senders = fn (ps) -> fn (base: int) -> fn (k: int) -> fn (chaos: i
   | Cons ((pid, p), rest) ->
     let out = channel_new () in
     let buf = base + k * bufsz in
-    // `(p : int)` is not documentation. Without it the Send check refuses the
-    // capture with "cannot capture `p` of unknown type across a thread boundary",
-    // even though the list it came from is annotated — the check runs before that
-    // has reached the pattern variable. PAIN.md P5.
-    let peer_port = (p : int) in
-    let peer_id = (pid : int) in
-    let _ = spawn (fn () -> sender peer_port out buf (0 - 1) chaos "") in
-    start_senders rest base (k + 1) chaos (Cons ((peer_id, out), acc));
+    let _ = spawn (fn () -> sender p out buf (0 - 1) chaos "") in
+    start_senders rest base (k + 1) chaos (Cons ((pid, out), acc));
 
 let rec peer_slots = fn (ps) ->
   match ps with
