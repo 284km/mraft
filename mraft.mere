@@ -1,0 +1,144 @@
+// mraft.mere — a node that notices when the other one stops talking.
+//
+//   $ mere -c mraft.mere > m.c && clang -O2 m.c -o mraft
+//   $ ./mraft follower 7001
+//   $ ./mraft leader 7001            # in another shell
+//   $ kill the leader                # the follower says so, and how long it waited
+//
+// This is M0 of a Raft implementation, and it deliberately implements none of
+// Raft: no election, no log, no term negotiation. What it implements is the one
+// thing every earlier Mere program left out — **a wait that can end without an
+// answer**.
+//
+// Every network program written in Mere so far (the Postgres, Redis and HTTP
+// clients; the mdns resolver; the mkv server) assumes the other side replies.
+// Raft's entire structure is the opposite assumption: a follower waits for a
+// heartbeat, and when none arrives it must conclude something and act. So the
+// first slice is the smallest program whose subject is a **failure**, and whose
+// test kills a process on purpose.
+
+extern fn tcp_listen: int -> int;
+extern fn tcp_accept: int -> int;
+extern fn tcp_connect: str -> int -> int;
+extern fn tcp_read: int -> int -> int -> int;
+extern fn tcp_write: int -> int -> int -> int;
+extern fn tcp_close: int -> unit;
+extern fn tcp_set_timeout: int -> int -> int;
+extern fn now_ms: unit -> int;
+extern fn mem_alloc: int -> int;
+extern fn mem_get_u8: int -> int -> int;
+extern fn mem_to_str: int -> int -> str;
+extern fn mem_copy_str: int -> int -> str -> int;
+
+// Raft's timing constraint is `heartbeat << election timeout << MTBF`. These are
+// small so the demo is watchable; the ratio is what matters, and it is the one
+// number a real deployment tunes.
+let heartbeat_ms = 300;
+let election_timeout_ms = 1000;
+
+let bufsz = 4096;
+
+// ---- what a read returns ---------------------------------------------------
+// `tcp_read` hands back what read(2) did: a positive count, 0 at end of stream,
+// and -1 for everything else. With SO_RCVTIMEO set, "everything else" covers
+// both "the deadline passed" and "the connection broke", and the difference
+// between those two is exactly what this program exists to act on. Reading the
+// clock is how it tells them apart: a -1 that arrives early is an error, and a
+// -1 that arrives at the deadline is a timeout.
+//
+// That is a workaround, and PAIN.md keeps it as one. The honest shape is a
+// return type that says which happened.
+// (Named `recv_outcome`, not `wait`: a type called `wait` compiles to C that
+// collides with `union wait` in <sys/wait.h>, and the compiler's reserved-name
+// warning only looks at `let` names, never at `type` names. PAIN.md P1.)
+type recv_outcome = Heard of str | TimedOut of int | Gone;
+
+let recv_line = fn (fd: int) -> fn (buf: int) -> fn (deadline_ms: int) ->
+  let started = now_ms () in
+  let n = tcp_read fd buf bufsz in
+  if n > 0 then Heard (mem_to_str buf n)
+  else if n == 0 then Gone
+  else
+    let waited = now_ms () - started in
+    // A timeout is a read that came back *after* having waited for one. Anything
+    // that fails faster than the deadline it was given failed for another
+    // reason, and calling that a timeout would be a lie the caller acts on.
+    if waited + 50 >= deadline_ms then TimedOut (waited) else Gone;
+
+// ---- follower --------------------------------------------------------------
+// Waits for heartbeats and reports the first gap longer than the election
+// timeout. A real follower would become a candidate here (M1); this one says
+// what it would do and stops, because a slice that stops at a named boundary is
+// easier to believe than one that keeps going into code nothing tests yet.
+let rec follow = fn (fd: int) -> fn (buf: int) -> fn (heard: int) ->
+  match recv_line fd buf election_timeout_ms with
+  | Heard (msg) ->
+    let _ = print ("follower: heartbeat " ++ str_of_int (heard + 1)
+                   ++ " <- " ++ msg) in
+    follow fd buf (heard + 1)
+  | TimedOut (waited) ->
+    let _ = print ("follower: no heartbeat for " ++ str_of_int waited
+                   ++ "ms (election timeout " ++ str_of_int election_timeout_ms
+                   ++ "ms) after " ++ str_of_int heard ++ " heartbeats") in
+    print "follower: would become a candidate here (M1)"
+  | Gone ->
+    // A peer whose *process* died gets here, not to TimedOut: the kernel sends
+    // a FIN on its behalf, so a crash is an orderly close as far as this socket
+    // is concerned. Silence is what a partition or a hung process looks like,
+    // and that is a different event with a different remedy. See PAIN.md P2.
+    print ("follower: leader closed the connection after "
+           ++ str_of_int heard ++ " heartbeats");
+
+let run_follower = fn (port: int) ->
+  let srv = tcp_listen port in
+  if srv < 0 then
+    print_err ("mraft: could not listen on :" ++ str_of_int port)
+  else
+    let _ = print ("follower: listening on :" ++ str_of_int port) in
+    let fd = tcp_accept srv in
+    if fd < 0 then
+      print_err "mraft: accept failed"
+    else
+      let _ = print "follower: leader connected" in
+      // The deadline lives on the socket, not in the loop: SO_RCVTIMEO is the
+      // only bounded wait the runtime has, so every wait in this program has to
+      // be a socket read. That constraint shapes the design more than anything
+      // in Raft does — see PAIN.md.
+      let _ = tcp_set_timeout fd election_timeout_ms in
+      let buf = mem_alloc bufsz in
+      follow fd buf 0;
+
+// ---- leader ----------------------------------------------------------------
+// Sends heartbeats forever at a fixed interval. Killing it is the test.
+let rec beat = fn (fd: int) -> fn (buf: int) -> fn (n: int) ->
+  let msg = "heartbeat term=1 n=" ++ str_of_int n in
+  let len = mem_copy_str buf 0 msg in
+  let w = tcp_write fd buf len in
+  if w < 0 then
+    print "leader: follower is gone"
+  else
+    let _ = print ("leader: sent " ++ msg) in
+    let _ = sleep_ms heartbeat_ms in
+    beat fd buf (n + 1);
+
+let run_leader = fn (port: int) ->
+  let fd = tcp_connect "127.0.0.1" port in
+  if fd < 0 then
+    print_err ("mraft: could not connect to :" ++ str_of_int port)
+  else
+    let _ = print ("leader: connected to :" ++ str_of_int port) in
+    let buf = mem_alloc bufsz in
+    beat fd buf 0;
+
+// ---- main ------------------------------------------------------------------
+let main = fn () ->
+  match args () with
+  | Cons (role, Cons (port_s, _)) ->
+    let port = int_of_str port_s in
+    if str_eq role "follower" then run_follower port
+    else if str_eq role "leader" then run_leader port
+    else print_err ("mraft: unknown role '" ++ role ++ "'")
+  | _ ->
+    print "usage: mraft <follower|leader> <port>";
+
+main ()
