@@ -11,16 +11,19 @@ mere -c mraft.mere > m.c && clang -O2 m.c -o mraft
 ```
 
 ```
-node 2: election timeout, standing for term 1
-node 3: voted for 2 in term 1
-node 1: voted for 2 in term 1
 node 2: became leader for term 1 with 2 votes
 node 1: following 2 in term 1 (was follower)
 node 3: following 2 in term 1 (was follower)
+node 2: accepted 1 term=1 cmd=hello
+node 2: applied 1 term=1 cmd=hello
+node 1: applied 1 term=1 cmd=hello
+node 3: applied 1 term=1 cmd=hello
 ```
 
-Freeze the leader (`kill -STOP`) and the other two elect one of themselves in a
-higher term. Thaw it (`kill -CONT`) and it discovers it is stale and follows.
+Freeze the leader (`kill -STOP`) and the other two elect one of themselves and keep
+accepting commands. Thaw it, and it finds it is stale, follows, and catches up. Kill
+one outright and restart it, and the leader walks its log back to index 1 and
+refills it.
 
 ## Why it exists
 
@@ -54,8 +57,16 @@ majority, and the rule that a node seeing a greater term steps down. Three nodes
 elect one leader, replace it when it goes silent, and never let two nodes hold the
 same term.
 
-Next: M2 (log replication and a commit index), M3 (a durable log that survives a
-crash), M4 (message loss and reordering, injected on purpose).
+**M2 — a replicated log.** Entries, the consistency check at the index before the
+one being sent, a commit index that advances on a majority, the election
+restriction that stops a node with a short log from being elected and erasing what
+was agreed, and a `PROP <command>` line any client can send. This is the first
+slice where the cluster is *for* something: three nodes apply the same commands in
+the same order, and keep doing so across a leader change, a freeze, and a restart
+from an empty log.
+
+Next: M3 (a durable log, so a restarted node does not begin from nothing), M4
+(message loss and reordering, injected on purpose).
 
 ## How it is built
 
@@ -97,13 +108,24 @@ is that *how* you kill it decides what you are testing:
 timeout exists for; a crash is immediate information. The first version of the
 test used `kill -9`, passed, and measured nothing.
 
-The check that earns its place is the last one: **no term was ever claimed by two
-leaders**, asserted over the whole run rather than at a moment. It is the property
-Raft exists to provide, and it caught a real bug in this implementation that the
-happy path hid completely — the first cluster this program ever ran elected one
-leader and held it, while votes were being broadcast to every peer instead of to
-the candidate. Two nodes only both won when they happened to become candidates
-close enough together. [PAIN.md](PAIN.md) has the details.
+The checks that earn their place are the two invariants, asserted over the whole
+run rather than at a moment:
+
+- **no term was ever claimed by two leaders**
+- **no index was ever applied with two different commands**
+
+The first caught a real bug that the happy path hid completely — the very first
+cluster this program ran elected one leader and held it, while vote responses were
+being broadcast to every peer instead of to the candidate, so every candidate
+counted somebody else's vote as its own. Two nodes only both won when they happened
+to become candidates close enough together.
+
+The second is the property the whole protocol exists to provide, and **no single
+node can check it**. It does not exist inside any of the processes; it only exists
+across their logs, which is the part of testing a distributed system that has no
+counterpart in testing a function.
+
+[PAIN.md](PAIN.md) has the details of both, and of what the language cost.
 
 ## Building
 

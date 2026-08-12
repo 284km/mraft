@@ -1,39 +1,35 @@
-// mraft.mere — three nodes elect a leader, and elect another when it stops.
+// mraft.mere — a replicated log: three nodes agree on a sequence of commands,
+// and keep agreeing when one of them stops.
 //
 //   $ mere -c mraft.mere > m.c && clang -O2 m.c -o mraft
-//   $ ./mraft 1 7001 7002 7003        # id, my port, then every port in the cluster
-//   $ ./mraft 2 7002 7001 7003
-//   $ ./mraft 3 7003 7001 7002
+//   $ ./mraft 1 7001 7001 7002 7003    # id, my port, then every port in id order
+//   $ ./mraft 2 7002 7001 7002 7003
+//   $ ./mraft 3 7003 7001 7002 7003
+//   $ printf 'PROP hello\n' | nc 127.0.0.1 7001     # to whichever node is leader
 //
-// M1: leader election. Terms, randomised election timeouts, RequestVote, and a
-// majority. No log yet — the state machine being replicated is nothing at all,
-// which is the part Raft leaves until last too.
+// M2: log replication. Entries, the consistency check at the index before the one
+// being sent, a commit index that advances on a majority, and the election
+// restriction that stops a node with a short log from becoming leader and erasing
+// what was already agreed. M0 established the failure vocabulary, M1 elected a
+// leader; this is the first slice where the cluster is *for* something.
 //
 // ---- the shape this program is built around --------------------------------
 //
-// A node has to do four things at once: serve peers that dial it, dial the peers
-// it needs to talk to, keep its own state consistent, and **notice that time has
-// passed**. Mere's `channel_recv` waits forever, and the only bounded wait the
-// runtime has is a socket timeout (M0's finding). Rather than fight that, this
-// program makes **time a message**: a ticker thread sends `Tick` into the same
-// inbox as every network event, and the node performs no timed wait at all. It
-// processes messages, and one kind of message happens to be "the clock moved".
+// A node has to serve peers that dial it, dial the peers it needs, keep its own
+// state consistent, and notice that time has passed. Mere's `channel_recv` waits
+// forever and the only bounded wait in the runtime is a socket timeout, so rather
+// than fight that, **time is a message**: a ticker thread sends `Tick` into the
+// same inbox as every network event, and the node performs no timed wait at all.
 //
-// That turns out to be right for more than one reason. A node whose only input
-// is a queue of events has exactly one place where state changes, so the state
-// needs no lock and never crosses a thread boundary — the actor discipline
-// `mkv` arrived at for its store. It also makes the election rules ordinary
-// functions from a state and an event to a state, which is the part worth
-// getting right.
+//   ticker  ──Tick──────┐
+//   reader ──RequestVote┤
+//   reader ──Append─────┼──> inbox ──> node (owns all state, one thread)
+//   reader ──Propose────┘                │
+//                                        └──> per-peer outbox ──> sender ──> TCP
 //
-//   ticker  ──Tick───────┐
-//   reader ──RequestVote─┤
-//   reader ──VoteGranted─┼──> inbox ──> node (owns all state, one thread)
-//   reader ──Heartbeat───┘                │
-//                                         └──> per-peer outbox ──> sender ──> TCP
-//
-// Senders are threads too, one per peer, because `tcp_connect` blocks and a node
-// that blocks on a peer that is down has stopped being a node.
+// With every input arriving as an event there is one place where state changes, so
+// the state needs no lock and never crosses a thread boundary, and the rules are
+// ordinary functions from a state and an event to a state.
 
 extern fn tcp_listen: int -> int;
 extern fn tcp_accept: int -> int;
@@ -47,19 +43,29 @@ extern fn mem_get_u8: int -> int -> int;
 extern fn mem_copy_str: int -> int -> str -> int;
 
 // Raft's one timing law is `heartbeat << election timeout << mean time between
-// failures`. The spread is what breaks split votes: if every node waited the
-// same time they would all become candidates together, split the vote, and do it
-// again forever. Randomising means someone almost always goes first.
+// failures`. The spread is what breaks split votes: if every node waited the same
+// time they would all become candidates together, split the vote, and do it again
+// forever. Randomising means someone almost always goes first.
 let heartbeat_ms = 150;
 let election_min_ms = 800;
 let election_spread_ms = 600;
 let tick_ms = 50;
 
-let bufsz = 1024;
+let bufsz = 4096;
 
 // ---- state -----------------------------------------------------------------
 type role = Follower | Candidate | Leader;
 
+// An entry is a term and a command. The term is not decoration: it is how two
+// logs are compared, and how a leader knows which of its entries are safe to
+// commit.
+type entry = Entry of (int * str);
+
+// The log is kept newest-first, so appending is a cons and `size` is the last
+// index. Reading index `i` walks `size - i` links, which is the wrong complexity
+// for a real system and the right amount of code for this one — a growable Vec
+// would have to outlive the region it was made in, and the actor loop has no
+// region to put one in.
 type node = {
   id: int,
   term: int,
@@ -68,25 +74,38 @@ type node = {
   votes: int,            // votes received as a candidate, including its own
   deadline: int,         // now_ms() past which a follower calls an election
   last_beat: int,        // when this node, as leader, last sent heartbeats
-  leader: int            // who it believes the leader is, -1 for nobody
+  leader: int,           // who it believes the leader is, -1 for nobody
+  log: entry list,       // newest first
+  size: int,             // last index, i.e. the length of `log`
+  commit: int,           // highest index known to be committed
+  applied: int,          // highest index handed to the state machine
+  peers: (int * int * int) list   // (peer id, next index to send, match index)
 };
 
-// Every message carries the sender's term, because a term is how Raft compares
-// two nodes' views of history: the larger always wins, and a node that sees one
-// steps down. Every arm below starts by checking it.
+// What a leader sends. A record rather than a seven-wide tuple, because the
+// fields are only distinguishable by name.
+type append = {
+  a_term: int,
+  a_leader: int,
+  a_prev: int,           // index immediately before the entry being sent
+  a_prev_term: int,      // its term — the consistency check compares this
+  a_commit: int,         // how far the leader has committed
+  a_ent_term: int,       // -1 for a heartbeat carrying no entry
+  a_cmd: str
+};
+
 type event =
     Tick
-  | RequestVote of (int * int)     // term, candidate id
-  | VoteGranted of (int * int)     // term, voter id
-  | Heartbeat of (int * int);      // term, leader id
+  | RequestVote of (int * int * int * int)   // term, candidate, last index, last term
+  | VoteGranted of (int * int)               // term, voter (sent only when granted)
+  | Append of append
+  | AppendResult of (int * int * int * int)  // term, from, 1 on success, match index
+  | Propose of str;                          // a client asking for a command
 
 // ---- wire format -----------------------------------------------------------
-// One message per line, three space-separated fields. Text, because a protocol
-// that can be read with `nc` while it is failing is worth more here than one
-// that is compact.
-let encode = fn (tag: str) -> fn (a: int) -> fn (b: int) ->
-  tag ++ " " ++ str_of_int a ++ " " ++ str_of_int b ++ chr 10;
-
+// One message per line, space-separated fields, the last of which may contain
+// spaces. Text, because a protocol that can be read with `nc` while it is failing
+// is worth more here than one that is compact.
 let rec field_at = fn (s: str) -> fn (want: int) -> fn (i: int) -> fn (k: int) -> fn (acc: str) ->
   if i >= str_len s then acc
   else
@@ -96,22 +115,50 @@ let rec field_at = fn (s: str) -> fn (want: int) -> fn (i: int) -> fn (k: int) -
     else if k == want then field_at s want (i + 1) k (acc ++ c)
     else field_at s want (i + 1) k acc;
 
+// Everything from field `k` to the end of the line, spaces included: a command is
+// arbitrary text and must not be cut at the first space.
+let rec rest_from = fn (s: str) -> fn (k: int) -> fn (i: int) -> fn (seen: int) ->
+  if i >= str_len s then ""
+  else if seen == k then substring s i (str_len s)
+  else if str_eq (substring s i (i + 1)) " " then rest_from s k (i + 1) (seen + 1)
+  else rest_from s k (i + 1) seen;
+
+let num = fn (line: str) -> fn (k: int) -> int_of_str (field_at line k 0 0 "");
+
 let decode = fn (line: str) ->
   let tag = field_at line 0 0 0 "" in
-  let a = int_of_str (field_at line 1 0 0 "") in
-  let b = int_of_str (field_at line 2 0 0 "") in
-  if str_eq tag "RV" then RequestVote (a, b)
-  else if str_eq tag "RVR" then VoteGranted (a, b)
-  else if str_eq tag "AE" then Heartbeat (a, b)
+  if str_eq tag "RV" then RequestVote (num line 1, num line 2, num line 3, num line 4)
+  else if str_eq tag "RVR" then VoteGranted (num line 1, num line 2)
+  else if str_eq tag "AE" then
+    Append (append { a_term = num line 1, a_leader = num line 2, a_prev = num line 3,
+                     a_prev_term = num line 4, a_commit = num line 5,
+                     a_ent_term = num line 6, a_cmd = rest_from line 7 0 0 })
+  else if str_eq tag "AER" then
+    AppendResult (num line 1, num line 2, num line 3, num line 4)
+  else if str_eq tag "PROP" then Propose (rest_from line 1 0 0)
   else Tick;                        // an unparseable line costs one wasted tick
 
-// ---- reading a peer's connection (one thread per accepted connection) ------
+let enc2 = fn (tag: str) -> fn (a: int) -> fn (b: int) ->
+  tag ++ " " ++ str_of_int a ++ " " ++ str_of_int b ++ chr 10;
+
+let enc4 = fn (tag: str) -> fn (a: int) -> fn (b: int) -> fn (c: int) -> fn (d: int) ->
+  tag ++ " " ++ str_of_int a ++ " " ++ str_of_int b ++ " " ++ str_of_int c
+      ++ " " ++ str_of_int d ++ chr 10;
+
+let enc_ae = fn (a: append) ->
+  "AE " ++ str_of_int a.a_term ++ " " ++ str_of_int a.a_leader
+        ++ " " ++ str_of_int a.a_prev ++ " " ++ str_of_int a.a_prev_term
+        ++ " " ++ str_of_int a.a_commit ++ " " ++ str_of_int a.a_ent_term
+        ++ " " ++ a.a_cmd ++ chr 10;
+
+// ---- reading a connection (one thread per accepted connection) -------------
 let rec read_line = fn (fd: int) -> fn (scratch: int) -> fn (acc: str) ->
   let n = tcp_read fd scratch 1 in
   if n < 1 then ""                  // EOF or error: the caller closes
   else
     let b = mem_get_u8 scratch 0 in
     if b == 10 then acc
+    else if b == 13 then read_line fd scratch acc     // a client typing CRLF
     else read_line fd scratch (acc ++ chr b);
 
 let rec reader = fn (fd: int) -> fn (inbox) -> fn (scratch: int) ->
@@ -125,7 +172,8 @@ let rec reader = fn (fd: int) -> fn (inbox) -> fn (scratch: int) ->
 // The connection is made on demand and remade after a failure, so a peer that is
 // not up yet, or that dies and comes back, costs one dropped message rather than
 // a stalled cluster. Dropping is allowed: Raft's RPCs are best-effort, and the
-// election timeout is what turns a lost message back into progress.
+// election timeout and the next heartbeat are what turn a lost message back into
+// progress.
 let rec sender = fn (port: int) -> fn (out_ch) -> fn (buf: int) -> fn (fd: int) ->
   let m = channel_recv out_ch in
   let live = if fd >= 0 then fd else tcp_connect "127.0.0.1" port in
@@ -140,10 +188,9 @@ let rec sender = fn (port: int) -> fn (out_ch) -> fn (buf: int) -> fn (fd: int) 
 
 // Peers are (id, outbox) pairs rather than a bare list of channels, because a
 // vote has an addressee. Sending one to everybody is not a wasteful broadcast —
-// it is wrong: every candidate in that term counts it as a vote for itself, and
-// a three-node cluster elects two leaders in the same term. That is what this
-// program did until the invariant check in verify.sh caught it, and the happy
-// path had looked perfect.
+// it is wrong: every candidate in that term counts it as a vote for itself, and a
+// three-node cluster elects two leaders in one term. That is what this program
+// did until the invariant check in verify.sh caught it.
 let rec broadcast = fn (outs) -> fn (m: str) ->
   match outs with
   | Nil -> ()
@@ -155,6 +202,30 @@ let rec send_to = fn (outs) -> fn (who: int) -> fn (m: str) ->
   | Cons ((pid, ch), rest) ->
     if pid == who then let _ = channel_send ch m in () else send_to rest who m;
 
+// ---- the log ---------------------------------------------------------------
+let rec skip = fn (log: entry list) -> fn (k: int) ->
+  if k <= 0 then log
+  else
+    match log with
+    | Nil -> Nil
+    | Cons (_, rest) -> skip rest (k - 1);
+
+let entry_at = fn (log: entry list) -> fn (size: int) -> fn (i: int) ->
+  if i <= 0 || i > size then Entry (0, "")
+  else
+    match skip log (size - i) with
+    | Nil -> Entry (0, "")
+    | Cons (e, _) -> e;
+
+// The term of index `i`: 0 before the log starts, which every log agrees on and is
+// what makes the consistency check bottom out; -1 for an index this node does not
+// have, which no real term equals, so the check fails rather than passing by
+// accident.
+let term_at = fn (log: entry list) -> fn (size: int) -> fn (i: int) ->
+  if i <= 0 then 0
+  else if i > size then 0 - 1
+  else match entry_at log size i with Entry (t, _) -> t;
+
 // ---- the node --------------------------------------------------------------
 let next_deadline = fn () ->
   now_ms () + election_min_ms + random_int election_spread_ms;
@@ -165,57 +236,133 @@ let name_of = fn (r: role) ->
   | Candidate -> "candidate"
   | Leader -> "leader";
 
+let rec reset_peers = fn (ps) -> fn (nx: int) ->
+  match ps with
+  | Nil -> Nil
+  | Cons ((pid, _, _), rest) -> Cons ((pid, nx, 0), reset_peers rest nx);
+
+let rec set_peer = fn (ps) -> fn (who: int) -> fn (nx: int) -> fn (mt: int) ->
+  match ps with
+  | Nil -> Nil
+  | Cons ((pid, n, m), rest) ->
+    if pid == who then Cons ((pid, nx, mt), rest)
+    else Cons ((pid, n, m), set_peer rest who nx mt);
+
+let rec peer_next = fn (ps) -> fn (who: int) ->
+  match ps with
+  | Nil -> 1
+  | Cons ((pid, n, _), rest) -> if pid == who then n else peer_next rest who;
+
+let rec count_ge = fn (ps) -> fn (n: int) ->
+  match ps with
+  | Nil -> 0
+  | Cons ((_, _, m), rest) -> (if m >= n then 1 else 0) + count_ge rest n;
+
+// Everything from `applied + 1` up to `commit` goes to the state machine, in
+// order. The state machine here is a line of output, which is enough for a test
+// to check that every node applied the same commands in the same order — the
+// property the whole protocol exists to provide.
+let rec apply_upto = fn (st: node) ->
+  if st.applied >= st.commit then st
+  else
+    let i = st.applied + 1 in
+    let _ =
+      match entry_at st.log st.size i with
+      | Entry (t, cmd) ->
+        print ("node " ++ str_of_int st.id ++ ": applied " ++ str_of_int i
+               ++ " term=" ++ str_of_int t ++ " cmd=" ++ cmd) in
+    apply_upto ({ st | applied = i });
+
 // A node that learns of a term greater than its own is out of date, whatever it
 // was doing: it becomes a follower of that term and forgets its vote. This one
 // rule is what keeps two leaders from coexisting, and it is applied on every
 // message rather than in any one place.
 let step_down = fn (st: node) -> fn (t: int) ->
-  node { id = st.id, term = t, part = Follower, voted_for = 0 - 1, votes = 0,
-         deadline = next_deadline (), last_beat = st.last_beat, leader = 0 - 1 };
+  { st | term = t, part = Follower, voted_for = 0 - 1, votes = 0,
+              deadline = next_deadline (), leader = 0 - 1 };
+
+// What a leader sends a particular peer: the entry at that peer's next index, or a
+// bare heartbeat when the peer is caught up. `a_prev` is the index before it, and
+// the follower refuses the whole message unless it has that index at that term —
+// which is how a log that diverged gets found and rewound.
+let ae_for = fn (st: node) -> fn (next: int) ->
+  if next <= st.size then
+    match entry_at st.log st.size next with
+    | Entry (et, cmd) ->
+      append { a_term = st.term, a_leader = st.id, a_prev = next - 1,
+               a_prev_term = term_at st.log st.size (next - 1),
+               a_commit = st.commit, a_ent_term = et, a_cmd = cmd }
+  else
+    append { a_term = st.term, a_leader = st.id, a_prev = st.size,
+             a_prev_term = term_at st.log st.size st.size,
+             a_commit = st.commit, a_ent_term = 0 - 1, a_cmd = "" };
+
+let rec beat_peers = fn (st: node) -> fn (outs) -> fn (ps) ->
+  match ps with
+  | Nil -> ()
+  | Cons ((pid, nx, _), rest) ->
+    let _ = send_to outs pid (enc_ae (ae_for st nx)) in
+    beat_peers st outs rest;
+
+// The largest index a majority stores. Restricted to entries from the current
+// term: an entry replicated by a majority but written in an older term is not safe
+// to commit on that basis alone (Raft's figure 8), and committing it is the
+// mistake that loses data.
+let rec highest_committed = fn (st: node) -> fn (quorum: int) -> fn (n: int) ->
+  if n <= st.commit then st.commit
+  else if 1 + count_ge st.peers n >= quorum && term_at st.log st.size n == st.term then n
+  else highest_committed st quorum (n - 1);
 
 let start_election = fn (st: node) -> fn (outs) -> fn (quorum: int) ->
   let t = st.term + 1 in
   let _ = print ("node " ++ str_of_int st.id ++ ": election timeout, standing for term "
                  ++ str_of_int t) in
-  let _ = broadcast outs (encode "RV" t st.id) in
-  // A candidate votes for itself. That is also why two candidates in one term
-  // deadlock until one of them times out again — with a different random
-  // deadline, which is the whole reason the deadline is random.
+  // The candidate's last index and term travel with the request: a voter refuses a
+  // candidate whose log is behind its own, which is what stops a node that missed
+  // entries from being elected and overwriting them.
+  let _ = broadcast outs (enc4 "RV" t st.id st.size (term_at st.log st.size st.size)) in
   if 1 >= quorum then
     let _ = print ("node " ++ str_of_int st.id ++ ": became leader for term "
                    ++ str_of_int t ++ " with 1 votes") in
-    node { id = st.id, term = t, part = Leader, voted_for = st.id, votes = 1,
-           deadline = next_deadline (), last_beat = 0, leader = st.id }
+    { st | term = t, part = Leader, voted_for = st.id, votes = 1,
+                deadline = next_deadline (), last_beat = 0, leader = st.id,
+                peers = reset_peers st.peers (st.size + 1) }
   else
-    node { id = st.id, term = t, part = Candidate, voted_for = st.id, votes = 1,
-           deadline = next_deadline (), last_beat = st.last_beat, leader = 0 - 1 };
+    { st | term = t, part = Candidate, voted_for = st.id, votes = 1,
+                deadline = next_deadline (), leader = 0 - 1 };
 
 let on_tick = fn (st: node) -> fn (outs) -> fn (quorum: int) ->
   let now = now_ms () in
   match st.part with
   | Leader ->
     if now >= st.last_beat + heartbeat_ms then
-      let _ = broadcast outs (encode "AE" st.term st.id) in
-      node { id = st.id, term = st.term, part = Leader, voted_for = st.voted_for,
-             votes = st.votes, deadline = st.deadline, last_beat = now,
-             leader = st.leader }
+      let _ = beat_peers st outs st.peers in
+      { st | last_beat = now }
     else st
   | Follower -> if now >= st.deadline then start_election st outs quorum else st
   | Candidate -> if now >= st.deadline then start_election st outs quorum else st;
 
 let on_request_vote = fn (st: node) -> fn (outs) -> fn (t: int) -> fn (cand: int) ->
+                      fn (last_i: int) -> fn (last_t: int) ->
   let st1 = if t > st.term then step_down st t else st in
-  // At most one vote per term, and only for a candidate whose term is current.
-  // The `voted_for == cand` case matters because a retried RequestVote has to
-  // get the same answer as the first one.
-  if t == st1.term && (st1.voted_for == 0 - 1 || st1.voted_for == cand) then
-    let _ = send_to outs cand (encode "RVR" t st1.id) in
+  let my_t = term_at st1.log st1.size st1.size in
+  // The election restriction: "at least as up to date" means a later last term,
+  // or the same last term and at least as many entries.
+  let current = last_t > my_t || (last_t == my_t && last_i >= st1.size) in
+  if t == st1.term && current && (st1.voted_for == 0 - 1 || st1.voted_for == cand) then
+    let _ = send_to outs cand (enc2 "RVR" t st1.id) in
     let _ = print ("node " ++ str_of_int st1.id ++ ": voted for " ++ str_of_int cand
                    ++ " in term " ++ str_of_int t) in
-    node { id = st1.id, term = st1.term, part = st1.part, voted_for = cand,
-           votes = st1.votes, deadline = next_deadline (), last_beat = st1.last_beat,
-           leader = st1.leader }
-  else st1;
+    { st1 | voted_for = cand, deadline = next_deadline () }
+  else
+    let _ =
+      if t == st1.term && current == false then
+        print ("node " ++ str_of_int st1.id ++ ": refused " ++ str_of_int cand
+               ++ " in term " ++ str_of_int t ++ " (its log is behind: "
+               ++ str_of_int last_i ++ "/" ++ str_of_int last_t ++ " vs mine "
+               ++ str_of_int st1.size ++ "/" ++ str_of_int my_t ++ ")")
+      else () in
+    st1;
 
 let on_vote_granted = fn (st: node) -> fn (outs) -> fn (t: int) -> fn (quorum: int) ->
   let st1 = if t > st.term then step_down st t else st in
@@ -224,58 +371,128 @@ let on_vote_granted = fn (st: node) -> fn (outs) -> fn (t: int) -> fn (quorum: i
     if t == st1.term then
       let v = st1.votes + 1 in
       if v >= quorum then
-        let _ = print ("node " ++ str_of_int st1.id ++ ": became leader for term "
-                       ++ str_of_int st1.term ++ " with " ++ str_of_int v ++ " votes") in
-        let _ = broadcast outs (encode "AE" st1.term st1.id) in
-        node { id = st1.id, term = st1.term, part = Leader, voted_for = st1.voted_for,
-               votes = v, deadline = next_deadline (), last_beat = now_ms (),
-               leader = st1.id }
-      else
-        node { id = st1.id, term = st1.term, part = Candidate, voted_for = st1.voted_for,
-               votes = v, deadline = st1.deadline, last_beat = st1.last_beat,
-               leader = st1.leader }
+        let st2 = { st1 | part = Leader, votes = v, leader = st1.id,
+                               last_beat = now_ms (),
+                               peers = reset_peers st1.peers (st1.size + 1) } in
+        let _ = print ("node " ++ str_of_int st2.id ++ ": became leader for term "
+                       ++ str_of_int st2.term ++ " with " ++ str_of_int v ++ " votes") in
+        let _ = beat_peers st2 outs st2.peers in
+        st2
+      else { st1 | votes = v }
     else st1
   | Follower -> st1
   | Leader -> st1;
 
-let on_heartbeat = fn (st: node) -> fn (t: int) -> fn (leader: int) ->
-  // A leader that hears from another leader of its OWN term is looking at a
-  // broken invariant, not at news: stepping down would make each of the two
-  // demote the other, which is what happened here before votes were addressed.
-  // Only a strictly greater term unseats a leader. A candidate, on the other
-  // hand, must yield to an equal term — that is someone having won the election
-  // it is still running.
-  let stale = if t < st.term then true
-              else match st.part with
-                   | Leader -> t == st.term
-                   | Follower -> false
-                   | Candidate -> false in
-  if stale then st
+let on_append = fn (st: node) -> fn (outs) -> fn (a: append) ->
+  // A leader that hears from another leader of its OWN term is looking at a broken
+  // invariant, not at news: stepping down would make each of the two demote the
+  // other. Only a strictly greater term unseats a leader. A candidate must yield to
+  // an equal term — that is someone having won the election it is still running.
+  let stale =
+    if a.a_term < st.term then true
+    else match st.part with
+         | Leader -> a.a_term == st.term
+         | Follower -> false
+         | Candidate -> false in
+  if stale then
+    // Answering a stale leader with our term is how it learns to step down.
+    let _ = send_to outs a.a_leader (enc4 "AER" st.term st.id 0 0) in
+    st
   else
     let _ =
-      if st.leader == leader && st.term == t then ()
-      else print ("node " ++ str_of_int st.id ++ ": following " ++ str_of_int leader
-                  ++ " in term " ++ str_of_int t ++ " (was " ++ name_of st.part ++ ")") in
-    node { id = st.id, term = t, part = Follower,
-           voted_for = if t > st.term then 0 - 1 else st.voted_for,
-           votes = 0, deadline = next_deadline (), last_beat = st.last_beat,
-           leader = leader };
+      if st.leader == a.a_leader && st.term == a.a_term then ()
+      else print ("node " ++ str_of_int st.id ++ ": following " ++ str_of_int a.a_leader
+                  ++ " in term " ++ str_of_int a.a_term
+                  ++ " (was " ++ name_of st.part ++ ")") in
+    let st1 = { st | term = a.a_term, part = Follower,
+                          voted_for = if a.a_term > st.term then 0 - 1 else st.voted_for,
+                          votes = 0, deadline = next_deadline (),
+                          leader = a.a_leader } in
+    // The consistency check. A follower accepts an entry only if it already has the
+    // entry before it, at the term the leader says — so one matching index implies
+    // every earlier index matches, by induction, and a log that diverged is found
+    // rather than silently kept.
+    if term_at st1.log st1.size a.a_prev != a.a_prev_term then
+      let _ = send_to outs a.a_leader (enc4 "AER" st1.term st1.id 0 0) in
+      st1
+    else
+      let st2 =
+        if a.a_ent_term < 0 then st1
+        else
+          // Anything after the matching point is discarded before appending: the
+          // leader's log is the truth, and a follower that kept its own tail would
+          // be a second history nobody agreed to.
+          let kept = skip st1.log (st1.size - a.a_prev) in
+          { st1 | log = Cons (Entry (a.a_ent_term, a.a_cmd), kept),
+                       size = a.a_prev + 1 } in
+      let mine = if a.a_ent_term < 0 then a.a_prev else a.a_prev + 1 in
+      let st3 = { st2 | commit = if a.a_commit < st2.size then a.a_commit
+                                      else st2.size } in
+      let st4 = apply_upto st3 in
+      let _ = send_to outs a.a_leader (enc4 "AER" st4.term st4.id 1 mine) in
+      st4;
+
+let on_append_result = fn (st: node) -> fn (outs) -> fn (t: int) -> fn (from: int) ->
+                       fn (ok: int) -> fn (match_i: int) -> fn (quorum: int) ->
+  if t > st.term then step_down st t
+  else
+    match st.part with
+    | Leader ->
+      if ok == 1 then
+        let st1 = { st | peers = set_peer st.peers from (match_i + 1) match_i } in
+        let c = highest_committed st1 quorum st1.size in
+        apply_upto ({ st1 | commit = c })
+      else
+        // The peer refused: it does not have the entry before the one we sent, so
+        // try one earlier. Walking back one index per round trip is Raft's simple
+        // version, and is fine when logs diverge by a little.
+        let nx = peer_next st.peers from in
+        let back = if nx > 1 then nx - 1 else 1 in
+        let st1 = { st | peers = set_peer st.peers from back 0 } in
+        let _ = send_to outs from (enc_ae (ae_for st1 back)) in
+        st1
+    | Follower -> st
+    | Candidate -> st;
+
+// A client asked for a command. Only a leader may append: a follower that accepted
+// one would be inventing history that no majority agreed to.
+let on_propose = fn (st: node) -> fn (outs) -> fn (cmd: str) -> fn (quorum: int) ->
+  match st.part with
+  | Leader ->
+    let st1 = { st | log = Cons (Entry (st.term, cmd), st.log), size = st.size + 1 } in
+    let _ = print ("node " ++ str_of_int st1.id ++ ": accepted " ++ str_of_int st1.size
+                   ++ " term=" ++ str_of_int st1.term ++ " cmd=" ++ cmd) in
+    // Replicate at once rather than waiting for the next heartbeat, and let a
+    // one-node cluster commit immediately.
+    let _ = beat_peers st1 outs st1.peers in
+    let c = highest_committed st1 quorum st1.size in
+    apply_upto ({ st1 | commit = c })
+  | Follower ->
+    let _ = print ("node " ++ str_of_int st.id ++ ": rejected a proposal (not leader; "
+                   ++ (if st.leader < 0 then "no leader known"
+                       else "leader is " ++ str_of_int st.leader) ++ ")") in
+    st
+  | Candidate ->
+    let _ = print ("node " ++ str_of_int st.id ++ ": rejected a proposal (mid-election)") in
+    st;
 
 let rec run = fn (st: node) -> fn (inbox) -> fn (outs) -> fn (quorum: int) ->
   let st2 =
     match channel_recv inbox with
     | Tick -> on_tick st outs quorum
-    | RequestVote (t, cand) -> on_request_vote st outs t cand
+    | RequestVote (t, cand, li, lt) -> on_request_vote st outs t cand li lt
     | VoteGranted (t, _) -> on_vote_granted st outs t quorum
-    | Heartbeat (t, leader) -> on_heartbeat st t leader in
+    | Append (a) -> on_append st outs a
+    | AppendResult (t, from, ok, mi) -> on_append_result st outs t from ok mi quorum
+    | Propose (cmd) -> on_propose st outs cmd quorum in
   run st2 inbox outs quorum;
 
 // ---- wiring ----------------------------------------------------------------
-// The byte arena is a bump allocator with no free and is not thread-safe, so
-// every buffer any thread will ever use is carved here, before anything is
-// spawned — the rule `mkv` found. Readers borrow a slot from a channel and
-// return it when their connection closes, which also caps how many peers can be
-// talking at once.
+// The byte arena is a bump allocator with no free and is not thread-safe, so every
+// buffer any thread will ever use is carved here, before anything is spawned — the
+// rule `mkv` found. Readers borrow a slot from a channel and return it when their
+// connection closes, which also caps how many peers and clients can be talking at
+// once.
 let reader_slots = 8;
 
 let rec fill = fn (ch) -> fn (i: int) ->
@@ -318,13 +535,18 @@ let rec start_senders = fn (ps) -> fn (base: int) -> fn (k: int) -> fn (acc) ->
     let out = channel_new () in
     let buf = base + k * bufsz in
     // `(p : int)` is not documentation. Without it the Send check refuses the
-    // capture with "cannot capture `p` of unknown type across a thread
-    // boundary", even though the list it came from is annotated — the check runs
-    // before that has reached the pattern variable. PAIN.md P5.
+    // capture with "cannot capture `p` of unknown type across a thread boundary",
+    // even though the list it came from is annotated — the check runs before that
+    // has reached the pattern variable. PAIN.md P5.
     let peer_port = (p : int) in
     let peer_id = (pid : int) in
     let _ = spawn (fn () -> sender peer_port out buf (0 - 1)) in
     start_senders rest base (k + 1) (Cons ((peer_id, out), acc));
+
+let rec peer_slots = fn (ps) ->
+  match ps with
+  | Nil -> Nil
+  | Cons ((pid, _), rest) -> Cons ((pid, 1, 0), peer_slots rest);
 
 let rec ints_of = fn (xs: str list) ->
   match xs with
@@ -362,17 +584,19 @@ let start = fn (id: int) -> fn (my_port: int) -> fn (ports: int list) ->
       let _ = print ("node " ++ str_of_int id ++ ": listening on :" ++ str_of_int my_port
                      ++ ", cluster of " ++ str_of_int cluster
                      ++ ", quorum " ++ str_of_int quorum) in
-      let peers = without (pairs_of ports 1) my_port in
+      let peer_list = without (pairs_of ports 1) my_port in
       let inbox = channel_new () in
       let free_ch = channel_new () in
       // Reader slots first, then one write buffer per peer.
       let base = mem_alloc ((reader_slots + cluster) * bufsz) in
       let _ = fill free_ch 0 in
-      let outs = start_senders peers (base + reader_slots * bufsz) 0 Nil in
+      let outs = start_senders peer_list (base + reader_slots * bufsz) 0 Nil in
       let _ = spawn (fn () -> acceptor srv inbox free_ch base) in
       let _ = spawn (fn () -> ticker inbox) in
       run (node { id = id, term = 0, part = Follower, voted_for = 0 - 1, votes = 0,
-                  deadline = next_deadline (), last_beat = 0, leader = 0 - 1 })
+                  deadline = next_deadline (), last_beat = 0, leader = 0 - 1,
+                  log = Nil, size = 0, commit = 0, applied = 0,
+                  peers = peer_slots peer_list })
           inbox outs quorum;
 
 let main = fn () ->

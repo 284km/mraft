@@ -121,6 +121,24 @@ redundant is this.
 
 ---
 
+## P6 — record update exists, and I wrote M1 without it
+
+`{ base | field = value }` is in the language and in the reference. M1's state
+transitions each rewrote all eight fields of the node record by hand, because I
+did not know that, and it read like a language missing an obvious thing. M2's node
+record has thirteen fields and the transitions are one line each.
+
+Not a defect — a documentation-findability observation, recorded because the wrong
+conclusion ("this language cannot update a record") was one I actually reached and
+would have written down as pain. `docs/language-reference.md` mentions the syntax
+in a table row about `|` and in one example line, and neither is where someone
+holding a large record looks.
+
+**Status:** not a bug. Kept as the reminder that "the language lacks X" is a claim
+that needs the same checking as any other.
+
+---
+
 ## What the language had nothing to do with
 
 Two bugs in M1 were mine, and both are worth recording because of *how* they were
@@ -163,10 +181,32 @@ logs as one timeline is a thing you have to do deliberately.
   every arm is handled. This is what an ML-family language is for and it has cost
   nothing.
 
+## What M2 confirmed about the shape
+
+The `(state, event) -> state` actor came out of M1's timing problem, and M2 is
+where it paid: **thirteen fields of node state, six kinds of event, and no locks
+anywhere**. Log replication is where a threaded implementation would start needing
+them — the leader's per-peer `next index` is mutable state touched on every
+response — and here it is just another field of the record the one owning thread
+rewrites.
+
+The test that matters most is the one no single node can perform: **no index was
+ever applied with two different commands**, checked across all three logs after
+the fact. A distributed property does not exist inside any of the processes, so it
+cannot be asserted from inside one.
+
+---
+
 ## Not yet known
 
 - **Memory under sustained load.** `mkv` wrapped each request in a `region` block
-  so that per-request garbage was reclaimed, and measured the result flat. M1 does
-  not: the actor loop allocates a state record and some strings per event and
-  relies on the general collector. Nothing has measured a node that has been
-  running for an hour, so nothing is claimed about it.
+  so per-request garbage was reclaimed, and measured the result flat. This does
+  not: the actor loop allocates a state record and some strings per event, and the
+  log is a list that only grows. Nothing has measured a node that has been running
+  for an hour, so nothing is claimed about it.
+- **Log complexity.** The log is a newest-first list, so reading index `i` walks
+  `size - i` links and the consistency check on a heartbeat walks the whole thing.
+  That is the wrong shape for a real log and the right amount of code for a slice
+  about correctness. A `Vec` would need a region that outlives the actor loop,
+  which is a genuine design question rather than an oversight — and it is the
+  question M3 has to answer anyway, since a durable log needs a file behind it.
