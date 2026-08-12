@@ -239,22 +239,17 @@ let term_at = fn (log: entry list) -> fn (size: int) -> fn (i: int) ->
   else match entry_at log size i with Entry (t, _) -> t;
 
 // ---- the write-ahead log ---------------------------------------------------
-// `file_pwrite` takes a Vec of bytes, so a line becomes one.
-let vec_of_str = fn (s: str) ->
-  let v = vec_new () in
-  let rec go = fn (i: int) ->
-    if i >= str_len s then v
-    else
-      let _ = vec_push v (ord (substring s i (i + 1))) in
-      go (i + 1) in
-  go 0;
-
 // Write one record and make it durable before returning. The fsync is the whole
 // point: a node that answers "I have it" and then loses it on a power cut has
 // broken the only promise the protocol makes on its behalf, and a majority of
 // such answers is how a committed entry disappears.
+//
+// This used to build a `Vec` with one boxed int per byte, because `file_pwrite`
+// takes `Vec[int]` — it predates the `bytes` type by a hundred versions. Reported
+// as PAIN.md P7 and fixed upstream in mere v0.1.222, which added
+// `file_pwrite_bytes`; the conversion a record needs is now `bytes_of_str`.
 let wal_write = fn (h: File) -> fn (off: int) -> fn (line: str) ->
-  let n = file_pwrite h off (vec_of_str line) in
+  let n = file_pwrite_bytes h off (bytes_of_str line) in
   let _ = file_fsync h in
   off + n;
 

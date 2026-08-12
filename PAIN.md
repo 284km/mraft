@@ -139,9 +139,9 @@ that needs the same checking as any other.
 
 ---
 
-## P7 — positioned write predates `bytes` and still wants a `Vec` of ints
+## P7 — positioned write predated `bytes` (fixed in mere v0.1.222)
 
-The write-ahead log is text, and writing one line of it goes:
+The write-ahead log is text, and writing one line of it used to go:
 
 ```mere
 let vec_of_str = fn (s: str) ->
@@ -158,14 +158,23 @@ takes `Vec[int]`. It was added for the `mbtree` dogfood (v0.1.115), before the
 So the language now has a byte string, and the one API that writes at an offset
 cannot take it.
 
-The fix upstream is small and obvious in hindsight: `file_pwrite` should accept
-`bytes`, the way `write_bytes` does. Nothing here needs it to be fast — the point
-is that a program with a `bytes` in hand should not have to explode it into a list
-of integers to write it somewhere.
+Fixed upstream by adding `file_pwrite_bytes : File -> int -> bytes -> int` — the
+same operation over `bytes`, on all four backends. Both remain, because `mbtree`
+builds its pages as Vecs and has no reason to change. The line above is now:
 
-**Status:** open, worth an upstream slice. It is the same shape as P4: an FFI or
-capability that was right when it was added and is now inconsistent with a type the
-language grew afterwards.
+```mere
+let n = file_pwrite_bytes h off (bytes_of_str line) in
+```
+
+Two things about the fix are worth keeping. **Wasm cost three lines**: its host
+import already took a bytes pointer, so the Vec version had been converting and then
+calling exactly this. And the positioned-IO family — `file_openrw` through
+`file_close`, on four backends since v0.1.163 — **was documented only in the
+changelog**, which is how this program came to write its log through the Vec-taking
+call for a whole slice before anyone noticed. It is in the stdlib reference now.
+
+That is the second findability finding in a row, after P6. Neither was a missing
+feature; both were a feature nobody could find.
 
 ---
 
