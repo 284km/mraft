@@ -139,10 +139,57 @@ that needs the same checking as any other.
 
 ---
 
+## P7 — positioned write predates `bytes` and still wants a `Vec` of ints
+
+The write-ahead log is text, and writing one line of it goes:
+
+```mere
+let vec_of_str = fn (s: str) ->
+  let v = vec_new () in
+  let rec go = fn (i: int) ->
+    if i >= str_len s then v
+    else let _ = vec_push v (ord (substring s i (i + 1))) in go (i + 1) in
+  go 0;
+```
+
+— a `Vec` with **one boxed int per byte**, built per record, because `file_pwrite`
+takes `Vec[int]`. It was added for the `mbtree` dogfood (v0.1.115), before the
+`bytes` type existed (v0.1.216) and before `bytes` had its I/O boundary (v0.1.219).
+So the language now has a byte string, and the one API that writes at an offset
+cannot take it.
+
+The fix upstream is small and obvious in hindsight: `file_pwrite` should accept
+`bytes`, the way `write_bytes` does. Nothing here needs it to be fast — the point
+is that a program with a `bytes` in hand should not have to explode it into a list
+of integers to write it somewhere.
+
+**Status:** open, worth an upstream slice. It is the same shape as P4: an FFI or
+capability that was right when it was added and is now inconsistent with a type the
+language grew afterwards.
+
+---
+
 ## What the language had nothing to do with
 
-Two bugs in M1 were mine, and both are worth recording because of *how* they were
+These bugs were mine, and they are worth recording because of *how* they were
 caught rather than what they were.
+
+**A new leader had no entry of its own, so it could never commit what it
+inherited.** `highest_committed` only counts an index as committed when the entry
+there is from the current term — Raft's figure 8, and correct. What was missing is
+the other half of that rule: a leader must append one entry in its own term on
+election, or a log full of earlier terms can never be committed at all.
+
+Nothing in M1 or M2 showed this, because there was always a fresh entry arriving in
+the current term. **The durability test is what made it visible**: restart the whole
+cluster, and the new leader comes up holding four recovered entries, commits
+nothing, and applies nothing. Three nodes with all the data, refusing to serve it.
+The fix is one no-op entry per election, which then commits on a majority and
+carries everything before it.
+
+That is the second time here that an entirely correct-looking cluster was wrong in a
+way only a specific failure could reveal — and the first time the failure had to be
+*total*, because a majority surviving is exactly what hides it.
 
 **Votes were broadcast instead of addressed.** `on_request_vote` sent its
 `RVR` to every peer, so in a three-node cluster every candidate in that term
@@ -158,6 +205,18 @@ tail -1` walks the files in *filename* order, not in time order, so "the latest
 term" was whatever node 3 happened to say last. The test then stopped the wrong
 node and waited ten seconds for a leader that already existed. Reading several
 logs as one timeline is a thing you have to do deliberately.
+
+**The test killed the wrong process, and blamed the program.** M3's nodes have to
+run in a temp directory (they write a log file beside themselves), so the harness
+started each one as `( cd "$TMP" && ./mraft ... & echo $! > pid )`. Backgrounding a
+`cd X && cmd` compound records the **subshell's** pid, not the node's. So `kill -9`
+killed a subshell and left the node running with its port bound, `kill -STOP` froze
+something that was not the leader, and four checks failed at once — the restarted
+node's log said `could not listen on :7682`, which reads exactly like a bug in the
+program. An `exec` in the inner subshell makes the recorded pid the node's own.
+
+Three harness bugs now, against two program bugs. Testing a distributed system
+means writing a small distributed system to test it with, and that one has bugs too.
 
 ---
 

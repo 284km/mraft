@@ -14,16 +14,20 @@ mere -c mraft.mere > m.c && clang -O2 m.c -o mraft
 node 2: became leader for term 1 with 2 votes
 node 1: following 2 in term 1 (was follower)
 node 3: following 2 in term 1 (was follower)
-node 2: accepted 1 term=1 cmd=hello
-node 2: applied 1 term=1 cmd=hello
-node 1: applied 1 term=1 cmd=hello
-node 3: applied 1 term=1 cmd=hello
+node 2: accepted 2 term=1 cmd=hello
+node 2: applied 2 term=1 cmd=hello
+node 1: applied 2 term=1 cmd=hello
+node 3: applied 2 term=1 cmd=hello
 ```
 
+Index 1 is the leader's own no-op, appended on election — see M3 below for why it
+has to exist.
+
 Freeze the leader (`kill -STOP`) and the other two elect one of themselves and keep
-accepting commands. Thaw it, and it finds it is stale, follows, and catches up. Kill
-one outright and restart it, and the leader walks its log back to index 1 and
-refills it.
+accepting commands. Thaw it, and it finds it is stale, follows, and catches up.
+Delete a node's `mraft-<id>.wal` and restart it, and the leader walks its log back
+to index 1 and refills it. **Kill all three and start them again, and the cluster
+comes back knowing what it agreed to.**
 
 ## Why it exists
 
@@ -65,8 +69,18 @@ slice where the cluster is *for* something: three nodes apply the same commands 
 the same order, and keep doing so across a leader change, a freeze, and a restart
 from an empty log.
 
-Next: M3 (a durable log, so a restarted node does not begin from nothing), M4
-(message loss and reordering, injected on purpose).
+**M3 — durability.** The term, the vote and every entry are written and fsynced
+*before* the node acts on them, so **the whole cluster can be killed and comes back
+knowing what it agreed to**. The write-ahead log is text, one record per line, and a
+follower's truncation is recorded by appending the replacement rather than by
+truncating the file — rewriting history is an append.
+
+That test is also what exposed the one thing missing from M2: a new leader with a
+log full of earlier terms could never commit any of it, because committing on a
+replica count is only safe for the current term. A leader now appends one no-op of
+its own on election, which commits and carries everything before it.
+
+Next: M4 (message loss and reordering, injected on purpose).
 
 ## How it is built
 
@@ -80,14 +94,22 @@ every network event, and the node performs no timed wait at all.
 ticker  ──Tick───────┐
 reader ──RequestVote─┤
 reader ──VoteGranted─┼──> inbox ──> node (owns all state, one thread)
-reader ──Heartbeat───┘                │
-                                      └──> per-peer outbox ──> sender ──> TCP
+reader ──Append──────┤                │
+reader ──Propose─────┘                ├──> per-peer outbox ──> sender ──> TCP
+                                      └──> mraft-<id>.wal (fsynced before replying)
 ```
 
 The missing feature turned out to be one nobody needs. With every input arriving
 as an event, there is exactly one place where state changes — so the state needs
-no lock and never crosses a thread boundary — and the election rules become five
-ordinary functions from a state and an event to a state.
+no lock and never crosses a thread boundary — and the rules become ordinary
+functions from a state and an event to a state. By M2 that state had thirteen
+fields, six kinds of event, and per-peer bookkeeping that a threaded version would
+need a lock for; there are still no locks.
+
+The write-ahead log is written from that same thread, and always **before** the
+reply that depends on it. A node that answers "I have it" and then loses it has
+broken the only promise the protocol makes on its behalf, and a majority of such
+answers is how a committed entry disappears.
 
 ## Testing a failure
 
@@ -103,10 +125,16 @@ is that *how* you kill it decides what you are testing:
 | still running | heartbeats keep arriving | stay followers |
 | stopped (`SIGSTOP`) | silence, socket still open | election timeout |
 | killed (`SIGKILL`) | the kernel sends FIN for it | an immediate close |
+| killed, and its `.wal` deleted | it comes back empty | the leader refills it |
+| all three killed | nothing is left running | disk is the only memory |
 
-**A crashed process is not a partition.** Only the middle row is what an election
+**A crashed process is not a partition.** Only the second row is what an election
 timeout exists for; a crash is immediate information. The first version of the
 test used `kill -9`, passed, and measured nothing.
+
+The last row is the one that found the most: a majority surviving is exactly what
+hides a leader's inability to commit what it inherited, so the bug only appears
+when nothing survives.
 
 The checks that earn their place are the two invariants, asserted over the whole
 run rather than at a moment:
@@ -125,14 +153,25 @@ node can check it**. It does not exist inside any of the processes; it only exis
 across their logs, which is the part of testing a distributed system that has no
 counterpart in testing a function.
 
-[PAIN.md](PAIN.md) has the details of both, and of what the language cost.
+Indexes are not compared directly, because each election adds a no-op and so the
+numbering depends on how many elections happened. What is compared is the sequence
+of **client** commands, which is what a client can observe, while the invariants
+still cover every index including the no-ops.
+
+[PAIN.md](PAIN.md) has the details, including the three bugs in the *test harness* —
+one more than the program has had. Testing a distributed system means writing a
+small distributed system to test it with, and that one has bugs too.
 
 ## Building
 
 Requires `mere` (v0.1.221 or later — earlier versions buffer the log away) and a
-C compiler. Native only: the program is TCP, threads and a monotonic clock, which
-reach the outside world through the C backend's FFI.
+C compiler. Native only: the program is TCP, threads, a monotonic clock and
+positioned file writes, which reach the outside world through the C backend's FFI.
 
 Node ids are positions in the cluster list, so `./mraft 2 7002 7001 7002 7003`
 means "I am node 2, my port is 7002, and the cluster is those three ports in id
 order". A node whose id and position disagree refuses to start.
+
+Each node keeps its write-ahead log in `mraft-<id>.wal` in the working directory,
+and reads it back on startup. Deleting one is how you simulate a lost disk; deleting
+all three is how you start over.

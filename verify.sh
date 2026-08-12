@@ -24,6 +24,12 @@
 # The first caught a real bug in this program that the happy path hid completely.
 # The second is the property the whole protocol exists to provide.
 #
+# Indexes are not compared directly, because a leader appends a no-op of its own on
+# election (see mraft.mere) and so the numbering depends on how many elections
+# happened. What is compared is the sequence of *client* commands, which is what a
+# client can observe, while the invariants still cover every index including the
+# no-ops.
+#
 #   sh verify.sh
 #
 # MERE=/path/to/mere overrides the compiler.
@@ -61,7 +67,18 @@ port_of() { echo $((BASE + $1 - 1)); }
 # Started from a subshell that exits immediately, so this shell has no job to
 # announce when a node is stopped or killed on purpose below.
 start_node() {   # start_node <id> <port>
-  ( "$TMP/mraft" "$1" "$2" "$P1" "$P2" "$P3" > "$TMP/n$1.log" 2>&1 &
+  # Two nested subshells, both load-bearing:
+  #
+  # The inner one `cd`s to the temp directory (each node writes its write-ahead log
+  # beside itself) and then **execs**, so the pid recorded is the node's own. Backing
+  # a `cd X && cmd` compound into the background records the *subshell's* pid
+  # instead, and killing that leaves the node running and holding its port — which
+  # made the restarted node die with "could not listen", the SIGSTOP freeze a
+  # different process entirely, and four checks fail for one reason.
+  #
+  # The outer one exits immediately, so this shell has no job to announce when a
+  # node is stopped or killed on purpose below.
+  ( ( cd "$TMP"; exec ./mraft "$1" "$2" "$P1" "$P2" "$P3" > "$TMP/n$1.log" 2>&1 ) &
     echo $! > "$TMP/n$1.pid" ) &
   wait $!
 }
@@ -116,13 +133,28 @@ applied_all() {
     "$TMP"/n*.log 2>/dev/null
 }
 
-# Kill a node outright and start it again. Its log file is kept under another name
-# so the invariants at the end still see what it did before.
-restart_node() {  # restart_node <id> <port>
+# Kill a node outright and start it again. Its output is kept under another name so
+# the invariants at the end still see what it did before. `wipe` also deletes its
+# write-ahead log, which is the difference between a crash and a lost disk.
+restart_node() {  # restart_node <id> <port> [wipe]
   kill -9 "$(cat "$TMP/n$1.pid")" 2>/dev/null || true
   sleep 0.4
-  mv "$TMP/n$1.log" "$TMP/n$1-before.log"
+  mv "$TMP/n$1.log" "$TMP/n$1-before$(date +%s%N 2>/dev/null || echo x).log"
+  [ "$3" = wipe ] && rm -f "$TMP/mraft-$1.wal"
   start_node "$1" "$2"
+}
+
+restart_all() {   # kill every node and bring them all back from disk alone
+  for i in 1 2 3; do kill -9 "$(cat "$TMP/n$i.pid")" 2>/dev/null || true; done
+  sleep 0.8
+  for i in 1 2 3; do mv "$TMP/n$i.log" "$TMP/n$i-run1.log"; done
+  for i in 1 2 3; do start_node "$i" "$(port_of "$i")"; done
+}
+
+# The commands a client asked for, in the order they were applied, with the
+# leaders' no-ops removed.
+commands_of() {  # commands_of <id>
+  applied_of "$1" | grep -v ' <noop>$' | cut -d" " -f3- | tr "\n" " "
 }
 
 start_node 1 "$P1"
@@ -161,14 +193,13 @@ fi
 sleep 0.8     # give the followers their heartbeat
 agreed=0
 for i in 1 2 3; do
-  got=$(applied_of "$i" | head -3 | tr '\n' '|')
-  [ "$got" = "1 1 alpha|2 1 beta|3 1 gamma|" ] && agreed=$((agreed + 1))
+  [ "$(commands_of "$i")" = "alpha beta gamma " ] && agreed=$((agreed + 1))
 done
 if [ "$agreed" = 3 ]; then
   ok "all three nodes applied alpha, beta, gamma in that order"
 else
-  bad "only $agreed of 3 nodes applied the same first three entries"
-  for i in 1 2 3; do echo "-- node $i"; applied_of "$i"; done
+  bad "only $agreed of 3 nodes applied the same three commands"
+  for i in 1 2 3; do echo "-- node $i: $(commands_of "$i")"; done
 fi
 
 # --- 3. a follower will not accept a proposal -------------------------------
@@ -194,20 +225,19 @@ fi
 # the restarted node has an empty log, so every AppendEntries is refused until the
 # leader has backed off to index 1. It also shows what M3 is for — a killed node
 # loses its entire log, because nothing is written down yet.
-restart_node "$other" "$(port_of "$other")"
+restart_node "$other" "$(port_of "$other")" wipe
 
-if wait_in "$TMP/n$other.log" 'applied 3 ' 100; then
-  ok "a node restarted from an empty log is refilled to index 3"
+i=0
+while [ "$i" -lt 100 ]; do
+  [ "$(commands_of "$other")" = "alpha beta gamma " ] && break
+  sleep 0.1
+  i=$((i + 1))
+done
+if [ "$(commands_of "$other")" = "alpha beta gamma " ]; then
+  ok "a node whose disk was wiped is refilled with the same commands"
 else
-  bad "the restarted node was not brought back up to date"
+  bad "the wiped node was not brought back up to date: $(commands_of "$other")"
   tail -6 "$TMP/n$other.log"
-fi
-
-if applied_of "$other" | head -3 | tr '\n' '|' \
-   | grep -q '^1 1 alpha|2 1 beta|3 1 gamma|$'; then
-  ok "and it received them in the original order"
-else
-  bad "the refilled log is not the original sequence"; applied_of "$other"
 fi
 
 # --- 5. the leader goes silent; the survivors carry on -----------------------
@@ -246,30 +276,40 @@ fi
 
 # The new leader must already hold what was committed before it was elected —
 # this is what the election restriction is for.
-if applied_of "$newleader" | grep -q '^3 1 gamma$'; then
-  ok "the new leader already holds what was committed before it (index 3)"
+if commands_of "$newleader" | grep -q 'alpha beta gamma'; then
+  ok "the new leader already holds what was committed before it"
 else
-  bad "the new leader is missing committed entry 3"; applied_of "$newleader"
+  bad "the new leader is missing committed commands: $(commands_of "$newleader")"
 fi
 
 # --- 6. the surviving majority still accepts new commands -------------------
 for v in delta epsilon; do propose "$(port_of "$newleader")" "$v"; done
 
-if wait_in "$TMP/n$newleader.log" 'applied 5 ' 60; then
-  ok "the surviving two commit two more (indexes 4 and 5)"
-else
-  bad "the survivors could not commit with one node down"
-  tail -5 "$TMP/n$newleader.log"
-fi
+i=0
+while [ "$i" -lt 80 ]; do
+  case "$(commands_of "$newleader")" in *"delta epsilon "*) break;; esac
+  sleep 0.1
+  i=$((i + 1))
+done
+case "$(commands_of "$newleader")" in
+  *"alpha beta gamma delta epsilon "*)
+    ok "the surviving two commit two more commands with one node down" ;;
+  *) bad "the survivors could not commit: $(commands_of "$newleader")" ;;
+esac
 
 # --- 7. the frozen node comes back and catches up ---------------------------
 kill -CONT "$(cat "$TMP/n$leader.pid")"
 
-if wait_in "$TMP/n$leader.log" 'applied 5 ' 80; then
-  ok "the revived node catches up to index 5 on its own"
-else
-  bad "the revived node did not catch up"; tail -6 "$TMP/n$leader.log"
-fi
+i=0
+while [ "$i" -lt 100 ]; do
+  case "$(commands_of "$leader")" in *"delta epsilon "*) break;; esac
+  sleep 0.1
+  i=$((i + 1))
+done
+case "$(commands_of "$leader")" in
+  *"delta epsilon "*) ok "the revived node catches up on its own" ;;
+  *) bad "the revived node did not catch up: $(commands_of "$leader")" ;;
+esac
 
 if grep -q 'following' "$TMP/n$leader.log"; then
   ok "and it stepped down rather than staying leader of its old term"
@@ -277,7 +317,54 @@ else
   bad "the revived node never stepped down"
 fi
 
-# --- 8. the invariants, over the whole run ----------------------------------
+# --- 8. the whole cluster dies, and comes back from disk alone ---------------
+# Nothing survives in any process. Everything the cluster agreed to has to come
+# back out of the three write-ahead logs, or it was never durable in the first
+# place — which is the difference between a consensus algorithm and a rumour.
+restart_all
+
+i=0
+while [ "$i" -lt 150 ]; do
+  n=0
+  for k in 1 2 3; do
+    case "$(commands_of "$k")" in
+      "alpha beta gamma delta epsilon ") n=$((n + 1)) ;;
+    esac
+  done
+  [ "$n" = 3 ] && break
+  sleep 0.1
+  i=$((i + 1))
+done
+
+survived=0
+for k in 1 2 3; do
+  [ "$(commands_of "$k")" = "alpha beta gamma delta epsilon " ] && survived=$((survived + 1))
+done
+if [ "$survived" = 3 ]; then
+  ok "all three nodes replayed the full sequence from disk after a total restart"
+else
+  bad "only $survived of 3 nodes recovered the sequence"
+  for k in 1 2 3; do echo "-- node $k: $(commands_of "$k")"; done
+fi
+
+recovered=$(grep -hc 'recovered term' "$TMP"/n*.log 2>/dev/null | paste -sd+ - | bc 2>/dev/null || echo 0)
+if [ "$recovered" -ge 3 ]; then
+  ok "and each of them said what it recovered"
+else
+  bad "only $recovered nodes reported recovering"
+fi
+
+# A restarted cluster must not invent anything: the only entries beyond the client
+# commands are leaders' no-ops.
+strays=$(applied_all | grep -v ' <noop>$' | cut -d" " -f3- | sort -u \
+         | grep -vxE 'alpha|beta|gamma|delta|epsilon' || true)
+if [ -z "$strays" ]; then
+  ok "and nothing was invented that no client asked for"
+else
+  bad "unexpected commands appeared: $strays"
+fi
+
+# --- 9. the invariants, over the whole run ----------------------------------
 dupes=$(grep -h 'became leader for term' "$TMP"/n*.log \
         | sed -n 's/.*term \([0-9]*\) .*/\1/p' | sort | uniq -d | tr '\n' ' ')
 if [ -z "$dupes" ]; then

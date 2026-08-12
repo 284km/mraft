@@ -7,11 +7,21 @@
 //   $ ./mraft 3 7003 7001 7002 7003
 //   $ printf 'PROP hello\n' | nc 127.0.0.1 7001     # to whichever node is leader
 //
-// M2: log replication. Entries, the consistency check at the index before the one
-// being sent, a commit index that advances on a majority, and the election
-// restriction that stops a node with a short log from becoming leader and erasing
-// what was already agreed. M0 established the failure vocabulary, M1 elected a
-// leader; this is the first slice where the cluster is *for* something.
+// M3: a durable log. Everything Raft requires to survive a crash — the current
+// term, the vote, and every entry — is written and fsynced *before* the node acts
+// on it, so a killed process comes back with what it promised rather than with
+// nothing. M0 established the failure vocabulary, M1 elected a leader, M2 made the
+// cluster agree on a sequence; this is the slice where the agreement outlives the
+// processes that made it.
+//
+// The write-ahead log is text, one record per line, in the order things happened:
+//
+//   T <term> <voted-for>          the vote in a term; the last one wins
+//   E <index> <term> <command>    an entry at that index
+//
+// An `E` at an index the log already has means the entry there was **replaced**,
+// so replay drops everything above it. That is how a follower's truncation is
+// recorded without a truncate syscall: rewriting history is an append.
 //
 // ---- the shape this program is built around --------------------------------
 //
@@ -79,7 +89,9 @@ type node = {
   size: int,             // last index, i.e. the length of `log`
   commit: int,           // highest index known to be committed
   applied: int,          // highest index handed to the state machine
-  peers: (int * int * int) list   // (peer id, next index to send, match index)
+  peers: (int * int * int) list,  // (peer id, next index to send, match index)
+  wal: File,             // the write-ahead log, open for append
+  wal_end: int           // how many bytes of it are written
 };
 
 // What a leader sends. A record rather than a seven-wide tuple, because the
@@ -226,6 +238,62 @@ let term_at = fn (log: entry list) -> fn (size: int) -> fn (i: int) ->
   else if i > size then 0 - 1
   else match entry_at log size i with Entry (t, _) -> t;
 
+// ---- the write-ahead log ---------------------------------------------------
+// `file_pwrite` takes a Vec of bytes, so a line becomes one.
+let vec_of_str = fn (s: str) ->
+  let v = vec_new () in
+  let rec go = fn (i: int) ->
+    if i >= str_len s then v
+    else
+      let _ = vec_push v (ord (substring s i (i + 1))) in
+      go (i + 1) in
+  go 0;
+
+// Write one record and make it durable before returning. The fsync is the whole
+// point: a node that answers "I have it" and then loses it on a power cut has
+// broken the only promise the protocol makes on its behalf, and a majority of
+// such answers is how a committed entry disappears.
+let wal_write = fn (h: File) -> fn (off: int) -> fn (line: str) ->
+  let n = file_pwrite h off (vec_of_str line) in
+  let _ = file_fsync h in
+  off + n;
+
+let persist_vote = fn (st: node) ->
+  { st | wal_end = wal_write st.wal st.wal_end
+                     ("T " ++ str_of_int st.term ++ " " ++ str_of_int st.voted_for
+                      ++ chr 10) };
+
+let persist_entry = fn (st: node) -> fn (i: int) -> fn (t: int) -> fn (cmd: str) ->
+  { st | wal_end = wal_write st.wal st.wal_end
+                     ("E " ++ str_of_int i ++ " " ++ str_of_int t ++ " " ++ cmd
+                      ++ chr 10) };
+
+let rec split_lines = fn (text: str) -> fn (i: int) -> fn (acc: str) -> fn (out) ->
+  if i >= str_len text then
+    (if str_len acc == 0 then out else Cons (acc, out))
+  else
+    let c = substring text i (i + 1) in
+    if str_eq c (chr 10) then split_lines text (i + 1) "" (Cons (acc, out))
+    else split_lines text (i + 1) (acc ++ c) out;
+
+// Replay, oldest record first, returning (term, voted for, log newest-first, size).
+// The log is rebuilt by the same rule the file was written under: an entry at an
+// index we already have replaces it, and everything above it goes.
+let rec replay = fn (lines: str list) -> fn (term: int) -> fn (voted: int) ->
+                 fn (log: entry list) -> fn (size: int) ->
+  match lines with
+  | Nil -> (term, voted, log, size)
+  | Cons (line, rest) ->
+    let tag = field_at line 0 0 0 "" in
+    if str_eq tag "T" then replay rest (num line 1) (num line 2) log size
+    else if str_eq tag "E" then
+      let i = num line 1 in
+      let t = num line 2 in
+      let cmd = rest_from line 3 0 0 in
+      let kept = if i <= size then skip log (size - i + 1) else log in
+      replay rest term voted (Cons (Entry (t, cmd), kept)) i
+    else replay rest term voted log size;
+
 // ---- the node --------------------------------------------------------------
 let next_deadline = fn () ->
   now_ms () + election_min_ms + random_int election_spread_ms;
@@ -270,7 +338,8 @@ let rec apply_upto = fn (st: node) ->
       match entry_at st.log st.size i with
       | Entry (t, cmd) ->
         print ("node " ++ str_of_int st.id ++ ": applied " ++ str_of_int i
-               ++ " term=" ++ str_of_int t ++ " cmd=" ++ cmd) in
+               ++ " term=" ++ str_of_int t ++ " cmd="
+               ++ (if str_len cmd == 0 then "<noop>" else cmd)) in
     apply_upto ({ st | applied = i });
 
 // A node that learns of a term greater than its own is out of date, whatever it
@@ -278,8 +347,11 @@ let rec apply_upto = fn (st: node) ->
 // rule is what keeps two leaders from coexisting, and it is applied on every
 // message rather than in any one place.
 let step_down = fn (st: node) -> fn (t: int) ->
-  { st | term = t, part = Follower, voted_for = 0 - 1, votes = 0,
-              deadline = next_deadline (), leader = 0 - 1 };
+  // The new term and the cleared vote are on disk before this returns: a node that
+  // forgot which term it was in could vote twice in it after a restart, which is
+  // exactly how two leaders happen.
+  persist_vote { st | term = t, part = Follower, voted_for = 0 - 1, votes = 0,
+                      deadline = next_deadline (), leader = 0 - 1 };
 
 // What a leader sends a particular peer: the entry at that peer's next index, or a
 // bare heartbeat when the peer is caught up. `a_prev` is the index before it, and
@@ -313,6 +385,30 @@ let rec highest_committed = fn (st: node) -> fn (quorum: int) -> fn (n: int) ->
   else if 1 + count_ge st.peers n >= quorum && term_at st.log st.size n == st.term then n
   else highest_committed st quorum (n - 1);
 
+// Becoming leader appends one entry of its own: a no-op, with an empty command.
+//
+// Without it a new leader can never commit anything it inherited. `highest_committed`
+// only counts an index as committed when the entry there is from the *current* term
+// — Raft's figure 8, and not a detail: counting replicas of an older term's entry
+// can commit something a later leader will legitimately overwrite. So a leader that
+// starts with a log full of previous terms sits there holding entries it may not
+// apply, and clients see a cluster that has their data and will not serve it. That
+// is exactly what a whole-cluster restart looks like, and it is what made this
+// missing: the entries came back from disk and nothing was ever applied again.
+//
+// One entry in the new term fixes it. When that commits on a majority, everything
+// before it is committed too, by the same induction the consistency check relies on.
+let become_leader = fn (st: node) -> fn (outs) -> fn (v: int) ->
+  let st1 = { st | part = Leader, votes = v, leader = st.id, last_beat = now_ms (),
+                   peers = reset_peers st.peers (st.size + 1) } in
+  let _ = print ("node " ++ str_of_int st1.id ++ ": became leader for term "
+                 ++ str_of_int st1.term ++ " with " ++ str_of_int v ++ " votes") in
+  let st2 = persist_entry { st1 | log = Cons (Entry (st1.term, ""), st1.log),
+                                  size = st1.size + 1 }
+                          (st1.size + 1) st1.term "" in
+  let _ = beat_peers st2 outs st2.peers in
+  st2;
+
 let start_election = fn (st: node) -> fn (outs) -> fn (quorum: int) ->
   let t = st.term + 1 in
   let _ = print ("node " ++ str_of_int st.id ++ ": election timeout, standing for term "
@@ -322,14 +418,11 @@ let start_election = fn (st: node) -> fn (outs) -> fn (quorum: int) ->
   // entries from being elected and overwriting them.
   let _ = broadcast outs (enc4 "RV" t st.id st.size (term_at st.log st.size st.size)) in
   if 1 >= quorum then
-    let _ = print ("node " ++ str_of_int st.id ++ ": became leader for term "
-                   ++ str_of_int t ++ " with 1 votes") in
-    { st | term = t, part = Leader, voted_for = st.id, votes = 1,
-                deadline = next_deadline (), last_beat = 0, leader = st.id,
-                peers = reset_peers st.peers (st.size + 1) }
+    become_leader (persist_vote { st | term = t, voted_for = st.id,
+                                       deadline = next_deadline () }) outs 1
   else
-    { st | term = t, part = Candidate, voted_for = st.id, votes = 1,
-                deadline = next_deadline (), leader = 0 - 1 };
+    persist_vote { st | term = t, part = Candidate, voted_for = st.id, votes = 1,
+                        deadline = next_deadline (), leader = 0 - 1 };
 
 let on_tick = fn (st: node) -> fn (outs) -> fn (quorum: int) ->
   let now = now_ms () in
@@ -350,10 +443,13 @@ let on_request_vote = fn (st: node) -> fn (outs) -> fn (t: int) -> fn (cand: int
   // or the same last term and at least as many entries.
   let current = last_t > my_t || (last_t == my_t && last_i >= st1.size) in
   if t == st1.term && current && (st1.voted_for == 0 - 1 || st1.voted_for == cand) then
-    let _ = send_to outs cand (enc2 "RVR" t st1.id) in
-    let _ = print ("node " ++ str_of_int st1.id ++ ": voted for " ++ str_of_int cand
+    // Durable before the answer goes out, in that order: a vote that is promised
+    // and then forgotten is a vote that can be cast again.
+    let st2 = persist_vote { st1 | voted_for = cand, deadline = next_deadline () } in
+    let _ = send_to outs cand (enc2 "RVR" t st2.id) in
+    let _ = print ("node " ++ str_of_int st2.id ++ ": voted for " ++ str_of_int cand
                    ++ " in term " ++ str_of_int t) in
-    { st1 | voted_for = cand, deadline = next_deadline () }
+    st2
   else
     let _ =
       if t == st1.term && current == false then
@@ -370,14 +466,7 @@ let on_vote_granted = fn (st: node) -> fn (outs) -> fn (t: int) -> fn (quorum: i
   | Candidate ->
     if t == st1.term then
       let v = st1.votes + 1 in
-      if v >= quorum then
-        let st2 = { st1 | part = Leader, votes = v, leader = st1.id,
-                               last_beat = now_ms (),
-                               peers = reset_peers st1.peers (st1.size + 1) } in
-        let _ = print ("node " ++ str_of_int st2.id ++ ": became leader for term "
-                       ++ str_of_int st2.term ++ " with " ++ str_of_int v ++ " votes") in
-        let _ = beat_peers st2 outs st2.peers in
-        st2
+      if v >= quorum then become_leader st1 outs v
       else { st1 | votes = v }
     else st1
   | Follower -> st1
@@ -423,8 +512,9 @@ let on_append = fn (st: node) -> fn (outs) -> fn (a: append) ->
           // leader's log is the truth, and a follower that kept its own tail would
           // be a second history nobody agreed to.
           let kept = skip st1.log (st1.size - a.a_prev) in
-          { st1 | log = Cons (Entry (a.a_ent_term, a.a_cmd), kept),
-                       size = a.a_prev + 1 } in
+          persist_entry { st1 | log = Cons (Entry (a.a_ent_term, a.a_cmd), kept),
+                                size = a.a_prev + 1 }
+                        (a.a_prev + 1) a.a_ent_term a.a_cmd in
       let mine = if a.a_ent_term < 0 then a.a_prev else a.a_prev + 1 in
       let st3 = { st2 | commit = if a.a_commit < st2.size then a.a_commit
                                       else st2.size } in
@@ -459,7 +549,10 @@ let on_append_result = fn (st: node) -> fn (outs) -> fn (t: int) -> fn (from: in
 let on_propose = fn (st: node) -> fn (outs) -> fn (cmd: str) -> fn (quorum: int) ->
   match st.part with
   | Leader ->
-    let st1 = { st | log = Cons (Entry (st.term, cmd), st.log), size = st.size + 1 } in
+    // On disk before it is replicated, and therefore before anybody can commit it.
+    let st1 = persist_entry { st | log = Cons (Entry (st.term, cmd), st.log),
+                                   size = st.size + 1 }
+                            (st.size + 1) st.term cmd in
     let _ = print ("node " ++ str_of_int st1.id ++ ": accepted " ++ str_of_int st1.size
                    ++ " term=" ++ str_of_int st1.term ++ " cmd=" ++ cmd) in
     // Replicate at once rather than waiting for the next heartbeat, and let a
@@ -548,6 +641,12 @@ let rec peer_slots = fn (ps) ->
   | Nil -> Nil
   | Cons ((pid, _), rest) -> Cons ((pid, 1, 0), peer_slots rest);
 
+let rec rev_onto = fn (xs: str list) -> fn (acc: str list) ->
+  match xs with
+  | Nil -> acc
+  | Cons (h, t) -> rev_onto t (Cons (h, acc));
+let list_rev = fn (xs: str list) -> rev_onto xs Nil;
+
 let rec ints_of = fn (xs: str list) ->
   match xs with
   | Nil -> Nil
@@ -593,11 +692,32 @@ let start = fn (id: int) -> fn (my_port: int) -> fn (ports: int list) ->
       let outs = start_senders peer_list (base + reader_slots * bufsz) 0 Nil in
       let _ = spawn (fn () -> acceptor srv inbox free_ch base) in
       let _ = spawn (fn () -> ticker inbox) in
-      run (node { id = id, term = 0, part = Follower, voted_for = 0 - 1, votes = 0,
-                  deadline = next_deadline (), last_beat = 0, leader = 0 - 1,
-                  log = Nil, size = 0, commit = 0, applied = 0,
-                  peers = peer_slots peer_list })
-          inbox outs quorum;
+      // Recovery happens before anything is served: a node that answered a vote
+      // request while still reading its own past could contradict it.
+      let path = "mraft-" ++ str_of_int id ++ ".wal" in
+      let text = if file_exists path then read_file path else "" in
+      // split_lines conses, so it comes out newest-first; replay wants the order
+      // the records were written in.
+      let ordered = list_rev (split_lines text 0 "" Nil) in
+      match replay ordered 0 (0 - 1) Nil 0 with
+      | (rterm, rvoted, rlog, rsize) ->
+        let _ =
+          if rsize > 0 || rterm > 0 then
+            print ("node " ++ str_of_int id ++ ": recovered term " ++ str_of_int rterm
+                   ++ ", vote " ++ str_of_int rvoted ++ ", " ++ str_of_int rsize
+                   ++ " entries from " ++ path)
+          else () in
+        let h = file_openrw path in
+        // Commit and applied are deliberately not persisted: Raft calls them
+        // volatile, and a restarted node learns how far to apply from the leader.
+        // The cost is that its state machine replays from the start, which a real
+        // one has to be idempotent about and which here means printing again.
+        run (node { id = id, term = rterm, part = Follower, voted_for = rvoted,
+                    votes = 0, deadline = next_deadline (), last_beat = 0,
+                    leader = 0 - 1, log = rlog, size = rsize, commit = 0,
+                    applied = 0, peers = peer_slots peer_list,
+                    wal = h, wal_end = str_len text })
+            inbox outs quorum;
 
 let main = fn () ->
   match args () with
