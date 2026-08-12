@@ -87,10 +87,30 @@ ever ran there had never been asked the question. At 25% the cluster still elect
 commits and agrees; at 45% safety holds and liveness degrades, which is the correct
 trade.
 
-Next: a client protocol. `PROP` gets no reply, so a client cannot tell a committed
-command from one that was accepted by a leader that then died — see PAIN.md P8. That
-is the difference between "the cluster agrees on an order" and "my write landed
-exactly once".
+**M5 — a client protocol.** `PROP <client> <seq> <command>` gets an answer, and the
+answer waits for the commit:
+
+```
+OK <index>        committed; it is in the log of a majority and will not move
+DUP <seq>         this exact request was already applied, once
+NOTLEADER <id>    ask that one instead
+LOST <index>      the leader that accepted it stepped down; ask again
+```
+
+That closes the gap M4 exposed. A command can be accepted by a leader that dies
+before replicating it, and a later leader discards it — correctly, since nobody was
+ever told otherwise. Now the silence is the message: the test freezes both followers
+and checks that **no** `OK` comes back, because a reply that waits for the append
+rather than the commit is a promise the cluster cannot keep.
+
+The sequence number is what makes a retry safe. A client that loses a reply must
+resend, the log can end up holding the request twice, and **every node de-duplicates
+at apply time from the same log** — not just the leader, or the state machines would
+diverge on exactly the entries that matter.
+
+Next: nothing named. Every failure this repository set out to handle is handled;
+what is left is scale (a log that is a list, snapshots, batching) rather than
+correctness.
 
 ## How it is built
 
@@ -138,6 +158,7 @@ is that *how* you kill it decides what you are testing:
 | killed, and its `.wal` deleted | it comes back empty | the leader refills it |
 | all three killed | nothing is left running | disk is the only memory |
 | `--chaos 25` | a quarter of peer messages lie | it still agrees |
+| both followers frozen | the leader can append, not commit | the client is told nothing |
 
 **A crashed process is not a partition.** Only the second row is what an election
 timeout exists for; a crash is immediate information. The first version of the

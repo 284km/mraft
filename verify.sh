@@ -46,7 +46,7 @@ bad() { printf '  FAIL  %s\n' "$1"; fail=$((fail + 1)); }
 
 TMP=$(mktemp -d)
 cleanup() {
-  for f in "$TMP"/*.pid "$TMP"/chaos/*.pid; do
+  for f in "$TMP"/*.pid "$TMP"/chaos/*.pid "$TMP"/client/*.pid; do
     [ -f "$f" ] || continue
     p=$(cat "$f")
     kill -CONT "$p" 2>/dev/null || true
@@ -83,8 +83,19 @@ start_node() {   # start_node <id> <port>
   wait $!
 }
 
+# A client sends `PROP <client-id> <seq> <command>` and waits for the answer. The
+# `sleep` matters: with stdin closed the moment printf finishes, nc half-closes and
+# exits before the reply arrives — which looked exactly like a server that does not
+# reply, and is not.
+ask() {          # ask <port> <client> <seq> <command> -> the reply line
+  { printf 'PROP %s %s %s\n' "$2" "$3" "$4"; sleep 1; } \
+    | nc -w 3 127.0.0.1 "$1" 2>/dev/null | head -1
+}
+
+# Fire and forget, for the phases that only care about the log.
 propose() {      # propose <port> <command>
-  printf 'PROP %s\n' "$2" | nc -w 1 127.0.0.1 "$1" >/dev/null 2>&1 || true
+  seqno=$((${seqno:-0} + 1))
+  ask "$1" 1 "$seqno" "$2" >/dev/null 2>&1 || true
 }
 
 wait_any() {     # wait_any <pattern> <tenths>
@@ -419,7 +430,7 @@ for v in c1 c2 c3 c4 c5; do
   tries=0
   while [ "$tries" -lt 25 ]; do
     for k in 1 2 3; do
-      printf 'PROP %s\n' "$v" | nc -w 1 127.0.0.1 "$((BASE + 9 + k))" >/dev/null 2>&1 || true
+      ask "$((BASE + 9 + k))" 2 "$tries$k" "$v" >/dev/null 2>&1 || true
     done
     j=0
     while [ "$j" -lt 20 ]; do
@@ -493,7 +504,164 @@ fi
 
 for i in 1 2 3; do kill -9 "$(cat "$CH/c$i.pid")" 2>/dev/null || true; done
 
-# --- 10. the invariants, over the whole run ---------------------------------
+# --- 10. what a client is told ----------------------------------------------
+# Until M5 `PROP` got no reply at all, so a client could not tell a committed command
+# from one accepted by a leader that died before replicating it. Everything a client
+# can be told is now said out loud, and each of these is a different answer:
+#
+#   OK <index>          committed; it is in the log of a majority and will not move
+#   DUP <seq>           this exact request was already applied, once
+#   NOTLEADER <id>      ask that one instead
+#   LOST <index>        the leader that accepted it stepped down; ask again
+CL="$TMP/client"
+mkdir -p "$CL"
+cp "$TMP/mraft" "$CL/mraft"
+
+D1=$((BASE + 20))
+D2=$((BASE + 21))
+D3=$((BASE + 22))
+
+start_client_node() {   # start_client_node <id> <port>
+  ( ( cd "$CL"; exec ./mraft "$1" "$2" "$D1" "$D2" "$D3" > "$CL/d$1.log" 2>&1 ) &
+    echo $! > "$CL/d$1.pid" ) &
+  wait $!
+}
+
+for i in 1 2 3; do start_client_node "$i" "$((BASE + 19 + i))"; done
+
+i=0
+while [ "$i" -lt 80 ]; do
+  grep -qh 'became leader' "$CL"/d*.log 2>/dev/null && break
+  sleep 0.1
+  i=$((i + 1))
+done
+dleader=$(grep -h 'became leader' "$CL"/d*.log 2>/dev/null \
+          | sed -n 's/^node \([0-9]*\):.*/\1/p' | tail -1)
+dother=1
+for i in 1 2 3; do [ "$i" != "$dleader" ] && dother=$i; done
+
+reply=$(ask "$((BASE + 19 + dleader))" 9 1 "committed-please")
+case "$reply" in
+  OK*) ok "the leader answers a client with $reply, after the entry commits" ;;
+  *)   bad "expected OK from the leader, got '$reply'" ;;
+esac
+
+# The index it named must be one the leader actually applied — the reply is not a
+# promise about the future.
+idx=$(printf '%s' "$reply" | sed -n 's/^OK \([0-9]*\)$/\1/p')
+if [ -n "$idx" ] && grep -q "applied $idx term=" "$CL/d$dleader.log"; then
+  ok "and index $idx is one it had applied by then"
+else
+  bad "the reply named index '$idx', which the leader had not applied"
+fi
+
+reply=$(ask "$((BASE + 19 + dother))" 9 2 "wrong-node")
+case "$reply" in
+  "NOTLEADER $dleader") ok "a follower answers NOTLEADER and names node $dleader" ;;
+  *) bad "expected 'NOTLEADER $dleader' from a follower, got '$reply'" ;;
+esac
+
+# The same (client, seq) again: answered, not applied a second time. This is what a
+# retry after a lost reply looks like, and it is the only reason the sequence number
+# is carried through the log.
+reply=$(ask "$((BASE + 19 + dleader))" 9 1 "committed-please")
+case "$reply" in
+  DUP*) ok "a repeat of client 9 seq 1 is answered $reply rather than applied again" ;;
+  *)    bad "expected DUP for a repeated request, got '$reply'" ;;
+esac
+
+# Count applications only. The leader also logs an `accepted` line for the same
+# command, and counting both would call one application two.
+applied_twice=$(grep -h 'applied .*cmd=committed-please' "$CL"/d*.log | wc -l | tr -d ' ')
+if [ "$applied_twice" = 3 ]; then
+  ok "and the command appears once per node, not twice"
+else
+  bad "committed-please was applied $applied_twice times across 3 nodes"
+  grep -h 'committed-please' "$CL"/d*.log
+fi
+
+# --- 11. a reply that must not come -----------------------------------------
+# Freeze both followers. The leader can still accept, but it cannot commit without a
+# majority — so `OK` must not arrive. This is the check that the reply waits for
+# commit rather than for the append; before M5 there was nothing to wait.
+for i in 1 2 3; do
+  [ "$i" = "$dleader" ] || kill -STOP "$(cat "$CL/d$i.pid")" 2>/dev/null || true
+done
+sleep 0.3
+
+reply=$(ask "$((BASE + 19 + dleader))" 9 3 "no-majority")
+if [ -z "$reply" ]; then
+  ok "with the majority frozen, no OK comes back at all"
+else
+  bad "got '$reply' for an entry no majority could have stored"
+fi
+
+if grep -q 'accepted .*cmd=no-majority' "$CL/d$dleader.log"; then
+  ok "though the leader did accept and log it (uncommitted, unanswered)"
+else
+  bad "the leader never even accepted the entry"
+fi
+
+for i in 1 2 3; do
+  [ "$i" = "$dleader" ] || kill -CONT "$(cat "$CL/d$i.pid")" 2>/dev/null || true
+done
+
+# What happens to that entry now is *not* guaranteed, and asserting that it commits
+# was this test being wrong twice before being right once. A frozen process's
+# monotonic clock keeps running, so both followers wake up believing they have heard
+# nothing for seconds and immediately stand for election; the old leader steps down,
+# and an accepted-but-uncommitted entry may legitimately be discarded by whoever
+# wins. That is precisely what the missing `OK` meant.
+#
+# So what is checked is the guarantee that does exist: the cluster works again, and
+# the doubtful entry ends up either everywhere or nowhere.
+# Liveness is an "eventually", so the check has to be one too: keep asking, with a
+# deadline, rather than once. Two nodes that just thawed both stand for election
+# immediately (their clocks ran while they were stopped, so they believe they have
+# heard nothing for seconds), and a cluster mid-election has nobody who can commit.
+#
+# Every attempt carries the same client id and sequence number — which is what a real
+# client does after a lost reply, and what makes the retries safe: the log can end up
+# holding the request twice, and the state machine applies it once.
+got=
+round=0
+while [ -z "$got" ] && [ "$round" -lt 6 ]; do
+  for k in 1 2 3; do
+    r=$(ask "$((BASE + 19 + k))" 9 4 "after-thaw")
+    case "$r" in OK*|DUP*) got=$r ;; esac
+    [ -n "$got" ] && break
+  done
+  round=$((round + 1))
+done
+if [ -n "$got" ]; then
+  ok "the cluster commits again once the majority is back ($got, round $round)"
+else
+  bad "nothing could be committed in 6 rounds after the followers returned"
+fi
+
+# The retries above may well have been logged more than once. Applied once is the
+# claim, and it is the sequence number that makes it true.
+thaw_applied=$(grep -h 'applied .*cmd=after-thaw' "$CL"/d*.log | wc -l | tr -d ' ')
+thaw_skipped=$(grep -hc 'already applied' "$CL"/d*.log 2>/dev/null \
+               | paste -sd+ - | bc 2>/dev/null || echo 0)
+if [ "$thaw_applied" -le 3 ]; then
+  ok "and the retried command was applied at most once per node ($thaw_applied, $thaw_skipped skipped as duplicates)"
+else
+  bad "after-thaw was applied $thaw_applied times across 3 nodes"
+fi
+
+holders=$(grep -hc 'applied .*cmd=no-majority' "$CL"/d*.log 2>/dev/null \
+          | paste -sd+ - | bc 2>/dev/null || echo 0)
+if [ "$holders" = 0 ] || [ "$holders" = 3 ]; then
+  ok "the entry no client was promised is on every node or on none ($holders of 3)"
+else
+  bad "the doubtful entry is on $holders of 3 nodes"
+  grep -h 'no-majority' "$CL"/d*.log
+fi
+
+for i in 1 2 3; do kill -9 "$(cat "$CL/d$i.pid")" 2>/dev/null || true; done
+
+# --- 12. the invariants, over the whole run ---------------------------------
 dupes=$(grep -h 'became leader for term' "$TMP"/n*.log \
         | sed -n 's/.*term \([0-9]*\) .*/\1/p' | sort | uniq -d | tr '\n' ' ')
 if [ -z "$dupes" ]; then

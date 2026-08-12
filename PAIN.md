@@ -249,7 +249,7 @@ means writing a small distributed system to test it with, and that one has bugs 
   every arm is handled. This is what an ML-family language is for and it has cost
   nothing.
 
-## P8 — a client cannot find out whether its command was committed
+## P8 — a client could not find out whether its command was committed (M5)
 
 `PROP <command>` gets no reply. The leader prints `accepted 4` and later
 `applied 4`, and the client — which has already closed its connection — learns
@@ -264,9 +264,30 @@ rather than applied twice. That is the difference between "the cluster agrees on
 order" — which this program does — and "my write landed exactly once", which it
 cannot say anything about.
 
-**Status:** open, and the honest next slice. It is also the thing that makes the
-chaos test's checks what they are: agreement, presence, and first-occurrence order,
-rather than exact equality.
+Closed in M5, by the protocol Raft specifies rather than by anything the language
+needed: `PROP <client> <seq> <command>` and four possible answers —
+
+```
+OK <index>        committed; it is in the log of a majority and will not move
+DUP <seq>         this exact request was already applied, once
+NOTLEADER <id>    ask that one instead
+LOST <index>      the leader that accepted it stepped down; ask again
+```
+
+The reply waits for the commit, which means the client's socket has to be parked
+somewhere until then — `pending : (int * int) list`, index and socket, answered when
+the commit index passes it and abandoned with `LOST` if the node steps down first.
+`verify.sh` freezes both followers and checks that **no** `OK` comes back: the reply
+waiting for the commit rather than for the append is the whole property, and before
+M5 there was nothing to wait.
+
+De-duplication is at apply time, in every node, from the same log — not only at the
+leader. That is what keeps the state machines identical: a leader-only check would
+make the follower that never saw the check apply a command its leader skipped.
+
+**Status:** closed. The language contributed nothing to this one; it is the first
+slice of which that is true, and worth recording as the answer to "what does Mere do
+about partial failure" being, here, "nothing, correctly".
 
 ---
 

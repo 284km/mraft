@@ -66,10 +66,13 @@ let bufsz = 4096;
 // ---- state -----------------------------------------------------------------
 type role = Follower | Candidate | Leader;
 
-// An entry is a term and a command. The term is not decoration: it is how two
-// logs are compared, and how a leader knows which of its entries are safe to
-// commit.
-type entry = Entry of (int * str);
+// An entry is a term, the client that asked for it, that client's sequence number,
+// and the command. The term is how two logs are compared and how a leader knows
+// which of its entries are safe to commit. The client and sequence number are what
+// make a retry recognisable: a network that can lose a reply forces every client to
+// resend, and a cluster that cannot tell a resend from a new request applies it
+// twice. Consensus gives an agreed order; it does not on its own give "once".
+type entry = Entry of (int * int * int * str);
 
 // The log is kept newest-first, so appending is a cons and `size` is the last
 // index. Reading index `i` walks `size - i` links, which is the wrong complexity
@@ -91,7 +94,15 @@ type node = {
   applied: int,          // highest index handed to the state machine
   peers: (int * int * int) list,  // (peer id, next index to send, match index)
   wal: File,             // the write-ahead log, open for append
-  wal_end: int           // how many bytes of it are written
+  wal_end: int,          // how many bytes of it are written
+  // The state machine's session table: the highest sequence number applied for
+  // each client. Rebuilt by replay, because it is part of the state machine rather
+  // than of the log — every node computes the same one from the same entries.
+  sessions: (int * int) list,
+  // Clients waiting to hear that their entry committed: (index, their socket).
+  // A reply before commit would be a lie a leader can be forced to retract.
+  pending: (int * int) list,
+  reply_buf: int         // arena offset this thread writes replies through
 };
 
 // What a leader sends. A record rather than a seven-wide tuple, because the
@@ -103,6 +114,8 @@ type append = {
   a_prev_term: int,      // its term — the consistency check compares this
   a_commit: int,         // how far the leader has committed
   a_ent_term: int,       // -1 for a heartbeat carrying no entry
+  a_client: int,
+  a_seq: int,
   a_cmd: str
 };
 
@@ -112,7 +125,7 @@ type event =
   | VoteGranted of (int * int)               // term, voter (sent only when granted)
   | Append of append
   | AppendResult of (int * int * int * int)  // term, from, 1 on success, match index
-  | Propose of str;                          // a client asking for a command
+  | Propose of (int * int * int * str);       // client, seq, their socket, command
 
 // ---- wire format -----------------------------------------------------------
 // One message per line, space-separated fields, the last of which may contain
@@ -137,17 +150,22 @@ let rec rest_from = fn (s: str) -> fn (k: int) -> fn (i: int) -> fn (seen: int) 
 
 let num = fn (line: str) -> fn (k: int) -> int_of_str (field_at line k 0 0 "");
 
-let decode = fn (line: str) ->
+let decode = fn (line: str) -> fn (fd: int) ->
   let tag = field_at line 0 0 0 "" in
   if str_eq tag "RV" then RequestVote (num line 1, num line 2, num line 3, num line 4)
   else if str_eq tag "RVR" then VoteGranted (num line 1, num line 2)
   else if str_eq tag "AE" then
     Append (append { a_term = num line 1, a_leader = num line 2, a_prev = num line 3,
                      a_prev_term = num line 4, a_commit = num line 5,
-                     a_ent_term = num line 6, a_cmd = rest_from line 7 0 0 })
+                     a_ent_term = num line 6, a_client = num line 7,
+                     a_seq = num line 8, a_cmd = rest_from line 9 0 0 })
   else if str_eq tag "AER" then
     AppendResult (num line 1, num line 2, num line 3, num line 4)
-  else if str_eq tag "PROP" then Propose (rest_from line 1 0 0)
+  else if str_eq tag "PROP" then
+    // The client's socket travels with the request, because the answer has to go
+    // back to it and cannot be sent until the entry commits — which may be many
+    // events later, on the other side of an election.
+    Propose (num line 1, num line 2, fd, rest_from line 3 0 0)
   else Tick;                        // an unparseable line costs one wasted tick
 
 let enc2 = fn (tag: str) -> fn (a: int) -> fn (b: int) ->
@@ -161,6 +179,7 @@ let enc_ae = fn (a: append) ->
   "AE " ++ str_of_int a.a_term ++ " " ++ str_of_int a.a_leader
         ++ " " ++ str_of_int a.a_prev ++ " " ++ str_of_int a.a_prev_term
         ++ " " ++ str_of_int a.a_commit ++ " " ++ str_of_int a.a_ent_term
+        ++ " " ++ str_of_int a.a_client ++ " " ++ str_of_int a.a_seq
         ++ " " ++ a.a_cmd ++ chr 10;
 
 // ---- reading a connection (one thread per accepted connection) -------------
@@ -177,7 +196,7 @@ let rec reader = fn (fd: int) -> fn (inbox) -> fn (scratch: int) ->
   let line = read_line fd scratch "" in
   if str_len line == 0 then tcp_close fd
   else
-    let _ = channel_send inbox (decode line) in
+    let _ = channel_send inbox (decode line fd) in
     reader fd inbox scratch;
 
 // ---- sending to one peer (one thread per peer) -----------------------------
@@ -249,10 +268,10 @@ let rec skip = fn (log: entry list) -> fn (k: int) ->
     | Cons (_, rest) -> skip rest (k - 1);
 
 let entry_at = fn (log: entry list) -> fn (size: int) -> fn (i: int) ->
-  if i <= 0 || i > size then Entry (0, "")
+  if i <= 0 || i > size then Entry (0, 0, 0, "")
   else
     match skip log (size - i) with
-    | Nil -> Entry (0, "")
+    | Nil -> Entry (0, 0, 0, "")
     | Cons (e, _) -> e;
 
 // The term of index `i`: 0 before the log starts, which every log agrees on and is
@@ -262,7 +281,7 @@ let entry_at = fn (log: entry list) -> fn (size: int) -> fn (i: int) ->
 let term_at = fn (log: entry list) -> fn (size: int) -> fn (i: int) ->
   if i <= 0 then 0
   else if i > size then 0 - 1
-  else match entry_at log size i with Entry (t, _) -> t;
+  else match entry_at log size i with Entry (t, _, _, _) -> t;
 
 // ---- the write-ahead log ---------------------------------------------------
 // Write one record and make it durable before returning. The fsync is the whole
@@ -284,9 +303,11 @@ let persist_vote = fn (st: node) ->
                      ("T " ++ str_of_int st.term ++ " " ++ str_of_int st.voted_for
                       ++ chr 10) };
 
-let persist_entry = fn (st: node) -> fn (i: int) -> fn (t: int) -> fn (cmd: str) ->
+let persist_entry = fn (st: node) -> fn (i: int) -> fn (t: int) -> fn (client: int) ->
+                    fn (seq: int) -> fn (cmd: str) ->
   { st | wal_end = wal_write st.wal st.wal_end
-                     ("E " ++ str_of_int i ++ " " ++ str_of_int t ++ " " ++ cmd
+                     ("E " ++ str_of_int i ++ " " ++ str_of_int t ++ " "
+                      ++ str_of_int client ++ " " ++ str_of_int seq ++ " " ++ cmd
                       ++ chr 10) };
 
 let rec split_lines = fn (text: str) -> fn (i: int) -> fn (acc: str) -> fn (out) ->
@@ -310,10 +331,58 @@ let rec replay = fn (lines: str list) -> fn (term: int) -> fn (voted: int) ->
     else if str_eq tag "E" then
       let i = num line 1 in
       let t = num line 2 in
-      let cmd = rest_from line 3 0 0 in
+      let client = num line 3 in
+      let seq = num line 4 in
+      let cmd = rest_from line 5 0 0 in
       let kept = if i <= size then skip log (size - i + 1) else log in
-      replay rest term voted (Cons (Entry (t, cmd), kept)) i
+      replay rest term voted (Cons (Entry (t, client, seq, cmd), kept)) i
     else replay rest term voted log size;
+
+// ---- sessions, and answering a client --------------------------------------
+let rec session_seq = fn (ss) -> fn (client: int) ->
+  match ss with
+  | Nil -> 0
+  | Cons ((c, q), rest) -> if c == client then q else session_seq rest client;
+
+let rec session_set = fn (ss) -> fn (client: int) -> fn (q: int) ->
+  match ss with
+  | Nil -> Cons ((client, q), Nil)
+  | Cons ((c, old), rest) ->
+    if c == client then Cons ((c, q), rest)
+    else Cons ((c, old), session_set rest client q);
+
+// Replies are written from the node's own thread, because it is the only one that
+// knows when an index committed. A dead socket costs one ignored -1.
+let reply_to = fn (st: node) -> fn (fd: int) -> fn (msg: str) ->
+  if fd < 0 then ()
+  else
+    let n = mem_copy_str st.reply_buf 0 (msg ++ chr 10) in
+    let _ = tcp_write fd st.reply_buf n in ();
+
+// Everyone whose entry has now committed hears about it. Pending is a list rather
+// than a queue because a leader that steps down has to answer all of them at once,
+// and the order it does that in is not observable by any one client.
+let rec answer_go = fn (st: node) -> fn (ps) -> fn (keep) ->
+  match ps with
+  | Nil -> { st | pending = keep }
+  | Cons ((idx, fd), rest) ->
+    if idx <= st.commit then
+      let _ = reply_to st fd ("OK " ++ str_of_int idx) in
+      answer_go st rest keep
+    else answer_go st rest (Cons ((idx, fd), keep));
+
+let answer_pending = fn (st: node) -> answer_go st st.pending Nil;
+
+// Losing leadership with clients still waiting: they are told, rather than left to
+// time out, because a leader that stepped down genuinely does not know whether
+// their entry will survive. "Ask again" is the honest answer and the one Raft's
+// client protocol expects.
+let rec abandon_go = fn (st: node) -> fn (ps) ->
+  match ps with
+  | Nil -> ()
+  | Cons ((idx, fd), rest) ->
+    let _ = reply_to st fd ("LOST " ++ str_of_int idx) in
+    abandon_go st rest;
 
 // ---- the node --------------------------------------------------------------
 let next_deadline = fn () ->
@@ -355,24 +424,39 @@ let rec apply_upto = fn (st: node) ->
   if st.applied >= st.commit then st
   else
     let i = st.applied + 1 in
-    let _ =
+    let st2 =
       match entry_at st.log st.size i with
-      | Entry (t, cmd) ->
-        print ("node " ++ str_of_int st.id ++ ": applied " ++ str_of_int i
-               ++ " term=" ++ str_of_int t ++ " cmd="
-               ++ (if str_len cmd == 0 then "<noop>" else cmd)) in
-    apply_upto ({ st | applied = i });
+      | Entry (t, client, seq, cmd) ->
+        if str_len cmd == 0 then
+          // A leader's no-op belongs to no client and changes nothing.
+          let _ = print ("node " ++ str_of_int st.id ++ ": applied " ++ str_of_int i
+                         ++ " term=" ++ str_of_int t ++ " cmd=<noop>") in
+          { st | applied = i }
+        else if seq <= session_seq st.sessions client then
+          // The same request twice. Every node skips it by the same rule, from the
+          // same log, so the state machines stay identical — which is why the
+          // de-duplication lives here and not only at the leader.
+          let _ = print ("node " ++ str_of_int st.id ++ ": skipped " ++ str_of_int i
+                         ++ " (client " ++ str_of_int client ++ " seq "
+                         ++ str_of_int seq ++ " already applied)") in
+          { st | applied = i }
+        else
+          let _ = print ("node " ++ str_of_int st.id ++ ": applied " ++ str_of_int i
+                         ++ " term=" ++ str_of_int t ++ " cmd=" ++ cmd) in
+          { st | applied = i, sessions = session_set st.sessions client seq } in
+    apply_upto st2;
 
 // A node that learns of a term greater than its own is out of date, whatever it
 // was doing: it becomes a follower of that term and forgets its vote. This one
 // rule is what keeps two leaders from coexisting, and it is applied on every
 // message rather than in any one place.
 let step_down = fn (st: node) -> fn (t: int) ->
+  let _ = abandon_go st st.pending in
   // The new term and the cleared vote are on disk before this returns: a node that
   // forgot which term it was in could vote twice in it after a restart, which is
   // exactly how two leaders happen.
   persist_vote { st | term = t, part = Follower, voted_for = 0 - 1, votes = 0,
-                      deadline = next_deadline (), leader = 0 - 1 };
+                      deadline = next_deadline (), leader = 0 - 1, pending = Nil };
 
 // What a leader sends a particular peer: the entry at that peer's next index, or a
 // bare heartbeat when the peer is caught up. `a_prev` is the index before it, and
@@ -381,14 +465,16 @@ let step_down = fn (st: node) -> fn (t: int) ->
 let ae_for = fn (st: node) -> fn (next: int) ->
   if next <= st.size then
     match entry_at st.log st.size next with
-    | Entry (et, cmd) ->
+    | Entry (et, client, seq, cmd) ->
       append { a_term = st.term, a_leader = st.id, a_prev = next - 1,
                a_prev_term = term_at st.log st.size (next - 1),
-               a_commit = st.commit, a_ent_term = et, a_cmd = cmd }
+               a_commit = st.commit, a_ent_term = et,
+               a_client = client, a_seq = seq, a_cmd = cmd }
   else
     append { a_term = st.term, a_leader = st.id, a_prev = st.size,
              a_prev_term = term_at st.log st.size st.size,
-             a_commit = st.commit, a_ent_term = 0 - 1, a_cmd = "" };
+             a_commit = st.commit, a_ent_term = 0 - 1,
+             a_client = 0, a_seq = 0, a_cmd = "" };
 
 let rec beat_peers = fn (st: node) -> fn (outs) -> fn (ps) ->
   match ps with
@@ -424,9 +510,9 @@ let become_leader = fn (st: node) -> fn (outs) -> fn (v: int) ->
                    peers = reset_peers st.peers (st.size + 1) } in
   let _ = print ("node " ++ str_of_int st1.id ++ ": became leader for term "
                  ++ str_of_int st1.term ++ " with " ++ str_of_int v ++ " votes") in
-  let st2 = persist_entry { st1 | log = Cons (Entry (st1.term, ""), st1.log),
+  let st2 = persist_entry { st1 | log = Cons (Entry (st1.term, 0, 0, ""), st1.log),
                                   size = st1.size + 1 }
-                          (st1.size + 1) st1.term "" in
+                          (st1.size + 1) st1.term 0 0 "" in
   let _ = beat_peers st2 outs st2.peers in
   st2;
 
@@ -533,9 +619,10 @@ let on_append = fn (st: node) -> fn (outs) -> fn (a: append) ->
           // leader's log is the truth, and a follower that kept its own tail would
           // be a second history nobody agreed to.
           let kept = skip st1.log (st1.size - a.a_prev) in
-          persist_entry { st1 | log = Cons (Entry (a.a_ent_term, a.a_cmd), kept),
+          persist_entry { st1 | log = Cons (Entry (a.a_ent_term, a.a_client,
+                                                   a.a_seq, a.a_cmd), kept),
                                 size = a.a_prev + 1 }
-                        (a.a_prev + 1) a.a_ent_term a.a_cmd in
+                        (a.a_prev + 1) a.a_ent_term a.a_client a.a_seq a.a_cmd in
       let mine = if a.a_ent_term < 0 then a.a_prev else a.a_prev + 1 in
       let st3 = { st2 | commit = if a.a_commit < st2.size then a.a_commit
                                       else st2.size } in
@@ -552,7 +639,7 @@ let on_append_result = fn (st: node) -> fn (outs) -> fn (t: int) -> fn (from: in
       if ok == 1 then
         let st1 = { st | peers = set_peer st.peers from (match_i + 1) match_i } in
         let c = highest_committed st1 quorum st1.size in
-        apply_upto ({ st1 | commit = c })
+        answer_pending (apply_upto ({ st1 | commit = c }))
       else
         // The peer refused: it does not have the entry before the one we sent, so
         // try one earlier. Walking back one index per round trip is Raft's simple
@@ -567,27 +654,47 @@ let on_append_result = fn (st: node) -> fn (outs) -> fn (t: int) -> fn (from: in
 
 // A client asked for a command. Only a leader may append: a follower that accepted
 // one would be inventing history that no majority agreed to.
-let on_propose = fn (st: node) -> fn (outs) -> fn (cmd: str) -> fn (quorum: int) ->
+//
+// The reply is the point of this slice. `OK <index>` goes out only once the entry
+// has committed, which can be several events and one election later — so the
+// client's socket is parked in `pending` until then. Everything else a client can
+// be told is also said out loud: `DUP` for a request already applied, `NOTLEADER`
+// with somewhere better to ask, `LOST` if the leader that accepted it stepped down.
+let on_propose = fn (st: node) -> fn (outs) -> fn (client: int) -> fn (seq: int) ->
+                 fn (fd: int) -> fn (cmd: str) -> fn (quorum: int) ->
   match st.part with
   | Leader ->
-    // On disk before it is replicated, and therefore before anybody can commit it.
-    let st1 = persist_entry { st | log = Cons (Entry (st.term, cmd), st.log),
-                                   size = st.size + 1 }
-                            (st.size + 1) st.term cmd in
-    let _ = print ("node " ++ str_of_int st1.id ++ ": accepted " ++ str_of_int st1.size
-                   ++ " term=" ++ str_of_int st1.term ++ " cmd=" ++ cmd) in
-    // Replicate at once rather than waiting for the next heartbeat, and let a
-    // one-node cluster commit immediately.
-    let _ = beat_peers st1 outs st1.peers in
-    let c = highest_committed st1 quorum st1.size in
-    apply_upto ({ st1 | commit = c })
+    if seq <= session_seq st.sessions client then
+      // Already applied. The lost reply is regenerated rather than the command
+      // applied a second time — the whole reason the sequence number is carried.
+      let _ = print ("node " ++ str_of_int st.id ++ ": duplicate from client "
+                     ++ str_of_int client ++ " seq " ++ str_of_int seq) in
+      let _ = reply_to st fd ("DUP " ++ str_of_int seq) in
+      st
+    else
+      // On disk before it is replicated, and therefore before anybody can commit it.
+      let st1 = persist_entry { st | log = Cons (Entry (st.term, client, seq, cmd),
+                                                 st.log),
+                                     size = st.size + 1 }
+                              (st.size + 1) st.term client seq cmd in
+      let _ = print ("node " ++ str_of_int st1.id ++ ": accepted " ++ str_of_int st1.size
+                     ++ " term=" ++ str_of_int st1.term ++ " cmd=" ++ cmd) in
+      let st2 = { st1 | pending = Cons ((st1.size, fd), st1.pending) } in
+      // Replicate at once rather than waiting for the next heartbeat, and let a
+      // one-node cluster commit immediately.
+      let _ = beat_peers st2 outs st2.peers in
+      let c = highest_committed st2 quorum st2.size in
+      answer_pending (apply_upto ({ st2 | commit = c }))
   | Follower ->
     let _ = print ("node " ++ str_of_int st.id ++ ": rejected a proposal (not leader; "
                    ++ (if st.leader < 0 then "no leader known"
                        else "leader is " ++ str_of_int st.leader) ++ ")") in
+    let _ = reply_to st fd (if st.leader < 0 then "NOLEADER"
+                            else "NOTLEADER " ++ str_of_int st.leader) in
     st
   | Candidate ->
     let _ = print ("node " ++ str_of_int st.id ++ ": rejected a proposal (mid-election)") in
+    let _ = reply_to st fd "NOLEADER" in
     st;
 
 let rec run = fn (st: node) -> fn (inbox) -> fn (outs) -> fn (quorum: int) ->
@@ -598,7 +705,8 @@ let rec run = fn (st: node) -> fn (inbox) -> fn (outs) -> fn (quorum: int) ->
     | VoteGranted (t, _) -> on_vote_granted st outs t quorum
     | Append (a) -> on_append st outs a
     | AppendResult (t, from, ok, mi) -> on_append_result st outs t from ok mi quorum
-    | Propose (cmd) -> on_propose st outs cmd quorum in
+    | Propose (client, seq, fd, cmd) ->
+      on_propose st outs client seq fd cmd quorum in
   run st2 inbox outs quorum;
 
 // ---- wiring ----------------------------------------------------------------
@@ -711,8 +819,11 @@ let start = fn (id: int) -> fn (my_port: int) -> fn (ports: int list) -> fn (cha
       let peer_list = without (pairs_of ports 1) my_port in
       let inbox = channel_new () in
       let free_ch = channel_new () in
-      // Reader slots first, then one write buffer per peer.
-      let base = mem_alloc ((reader_slots + cluster) * bufsz) in
+      // Reader slots, then one write buffer per peer, then one for this thread's
+      // replies to clients — the node writes those itself, since it is the only
+      // thread that knows when an index committed.
+      let base = mem_alloc ((reader_slots + cluster + 1) * bufsz) in
+      let reply_at = base + (reader_slots + cluster) * bufsz in
       let _ = fill free_ch 0 in
       let outs = start_senders peer_list (base + reader_slots * bufsz) 0 chaos Nil in
       let _ = spawn (fn () -> acceptor srv inbox free_ch base) in
@@ -741,7 +852,8 @@ let start = fn (id: int) -> fn (my_port: int) -> fn (ports: int list) -> fn (cha
                     votes = 0, deadline = next_deadline (), last_beat = 0,
                     leader = 0 - 1, log = rlog, size = rsize, commit = 0,
                     applied = 0, peers = peer_slots peer_list,
-                    wal = h, wal_end = str_len text })
+                    wal = h, wal_end = str_len text,
+                    sessions = Nil, pending = Nil, reply_buf = reply_at })
             inbox outs quorum;
 
 // `--chaos <pct>` may appear anywhere after the ports; everything else is a port.
