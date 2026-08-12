@@ -27,7 +27,8 @@ layer" shape as the `print_int` bug in v0.1.190.
 `wait` is also not on the list, which is a second, smaller thing: the list covers
 `<stdlib.h>`, `<math.h>`, `<time.h>` and POSIX I/O, but not `<sys/wait.h>`.
 
-**Status:** open. Worked around by naming the type `recv_outcome`.
+**Status:** open. Worked around by not naming a type `wait`, which is a fine
+thing to do and a poor thing to have to know.
 
 ---
 
@@ -81,13 +82,64 @@ whether the failure took as long as the deadline it was given. That works, and i
 is a workaround: it infers a cause from a duration.
 
 The shape that would not need it is a return type that says which happened —
-`Heard of str | TimedOut | Gone | Failed of int` — which the language can express
-perfectly well (`recv_outcome` in `mraft.mere` is that type, reconstructed on the
-outside). The FFI boundary is where it is lost: `extern fn` declarations are
-C-shaped, so everything arrives as an `int`.
+`Heard of str | TimedOut | Gone | Failed of int`, which the language expresses
+perfectly well. The FFI boundary is where it is lost: `extern fn` declarations are
+C-shaped, so everything arrives as an `int` and the caller reconstructs a meaning
+it should have been handed.
+
+M1 does not hit this, because it does no timed reads at all: making time a message
+removed every deadline from the socket layer, and a read either brings a message
+or ends the connection. The question comes back when a node needs to tell a peer
+that is *slow* from one that is *gone* — which is M2's problem, not M1's.
 
 **Status:** open, and the most interesting item here. It is the general question
 of how a capability reports *why* it failed, not just *that* it did.
+
+---
+
+## P5 — the Send check asks for a type that inference has not reached yet
+
+Spawning a thread that captures a peer's port was refused:
+
+```
+type error: cannot capture `p` of unknown type across a thread boundary
+    |     let _ = spawn (fn () -> sender p out buf (0 - 1)) in
+```
+
+`p` comes from `Cons (p, rest)` where the list is annotated two lines above, and
+it is an `int`. The Send check runs before that annotation has propagated to the
+pattern variable, so it sees an unresolved type variable and refuses rather than
+waiting.
+
+The message is honest about what happened, which is the good part: it says
+"unknown type", not "not Send". But the fix is to write `let peer_port = (p : int)
+in` and capture that instead — an ascription that carries no information the
+program did not already have, added to satisfy the order two passes run in.
+
+**Status:** open. Every capture in `mraft.mere` that a reader might think is
+redundant is this.
+
+---
+
+## What the language had nothing to do with
+
+Two bugs in M1 were mine, and both are worth recording because of *how* they were
+caught rather than what they were.
+
+**Votes were broadcast instead of addressed.** `on_request_vote` sent its
+`RVR` to every peer, so in a three-node cluster every candidate in that term
+counted a vote cast for somebody else as a vote for itself, and **two nodes became
+leader of term 1**. The happy path looked perfect — the first cluster this program
+ever ran elected one leader and held it — and the bug only appeared when two nodes
+timed out close enough together to both be candidates. What caught it was the
+invariant check in `verify.sh` ("no term was ever claimed by two leaders"), which
+looks at the whole run instead of at a moment.
+
+**The test read its own logs in the wrong order.** `grep -h ... "$TMP"/n*.log |
+tail -1` walks the files in *filename* order, not in time order, so "the latest
+term" was whatever node 3 happened to say last. The test then stopped the wrong
+node and waited ten seconds for a leader that already existed. Reading several
+logs as one timeline is a thing you have to do deliberately.
 
 ---
 
@@ -96,8 +148,25 @@ of how a capability reports *why* it failed, not just *that* it did.
 - **The type system.** A protocol whose states are `follower | candidate |
   leader` and whose messages are variants is what an ML-family language is for.
   Nothing has been fought yet.
-- **Regions.** Per-message allocation inside a `region` block is the same
-  discipline `mkv` used, and it carried over without thought.
+- **Nothing about expressing the protocol.** The election rules are five
+  functions from a state and an event to a state, and they read like the paper.
 - **`tcp_set_timeout`.** The one capability M0 was expected to need turned out to
   already exist (added for the `mdns` dogfood). The bounded wait was there; what
   is missing is the vocabulary to describe its outcome (P4).
+- **Making time a message.** `channel_recv` waits forever and there is no timed
+  receive, which sounded like the blocking problem for M1. It was not: a ticker
+  thread that sends `Tick` into the same inbox removes the need for one entirely,
+  and leaves the election rules as ordinary functions from a state and an event to
+  a state. The missing feature turned out to be a feature nobody needs.
+- **Records and variants for protocol state.** A node is a record, a role is a
+  three-way variant, an event is a four-way one, and the compiler checks that
+  every arm is handled. This is what an ML-family language is for and it has cost
+  nothing.
+
+## Not yet known
+
+- **Memory under sustained load.** `mkv` wrapped each request in a `region` block
+  so that per-request garbage was reclaimed, and measured the result flat. M1 does
+  not: the actor loop allocates a state record and some strings per event and
+  relies on the general collector. Nothing has measured a node that has been
+  running for an hour, so nothing is claimed about it.

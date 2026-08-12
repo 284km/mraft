@@ -1,21 +1,39 @@
-// mraft.mere — a node that notices when the other one stops talking.
+// mraft.mere — three nodes elect a leader, and elect another when it stops.
 //
 //   $ mere -c mraft.mere > m.c && clang -O2 m.c -o mraft
-//   $ ./mraft follower 7001
-//   $ ./mraft leader 7001            # in another shell
-//   $ kill the leader                # the follower says so, and how long it waited
+//   $ ./mraft 1 7001 7002 7003        # id, my port, then every port in the cluster
+//   $ ./mraft 2 7002 7001 7003
+//   $ ./mraft 3 7003 7001 7002
 //
-// This is M0 of a Raft implementation, and it deliberately implements none of
-// Raft: no election, no log, no term negotiation. What it implements is the one
-// thing every earlier Mere program left out — **a wait that can end without an
-// answer**.
+// M1: leader election. Terms, randomised election timeouts, RequestVote, and a
+// majority. No log yet — the state machine being replicated is nothing at all,
+// which is the part Raft leaves until last too.
 //
-// Every network program written in Mere so far (the Postgres, Redis and HTTP
-// clients; the mdns resolver; the mkv server) assumes the other side replies.
-// Raft's entire structure is the opposite assumption: a follower waits for a
-// heartbeat, and when none arrives it must conclude something and act. So the
-// first slice is the smallest program whose subject is a **failure**, and whose
-// test kills a process on purpose.
+// ---- the shape this program is built around --------------------------------
+//
+// A node has to do four things at once: serve peers that dial it, dial the peers
+// it needs to talk to, keep its own state consistent, and **notice that time has
+// passed**. Mere's `channel_recv` waits forever, and the only bounded wait the
+// runtime has is a socket timeout (M0's finding). Rather than fight that, this
+// program makes **time a message**: a ticker thread sends `Tick` into the same
+// inbox as every network event, and the node performs no timed wait at all. It
+// processes messages, and one kind of message happens to be "the clock moved".
+//
+// That turns out to be right for more than one reason. A node whose only input
+// is a queue of events has exactly one place where state changes, so the state
+// needs no lock and never crosses a thread boundary — the actor discipline
+// `mkv` arrived at for its store. It also makes the election rules ordinary
+// functions from a state and an event to a state, which is the part worth
+// getting right.
+//
+//   ticker  ──Tick───────┐
+//   reader ──RequestVote─┤
+//   reader ──VoteGranted─┼──> inbox ──> node (owns all state, one thread)
+//   reader ──Heartbeat───┘                │
+//                                         └──> per-peer outbox ──> sender ──> TCP
+//
+// Senders are threads too, one per peer, because `tcp_connect` blocks and a node
+// that blocks on a peer that is down has stopped being a node.
 
 extern fn tcp_listen: int -> int;
 extern fn tcp_accept: int -> int;
@@ -23,122 +41,350 @@ extern fn tcp_connect: str -> int -> int;
 extern fn tcp_read: int -> int -> int -> int;
 extern fn tcp_write: int -> int -> int -> int;
 extern fn tcp_close: int -> unit;
-extern fn tcp_set_timeout: int -> int -> int;
 extern fn now_ms: unit -> int;
 extern fn mem_alloc: int -> int;
 extern fn mem_get_u8: int -> int -> int;
-extern fn mem_to_str: int -> int -> str;
 extern fn mem_copy_str: int -> int -> str -> int;
 
-// Raft's timing constraint is `heartbeat << election timeout << MTBF`. These are
-// small so the demo is watchable; the ratio is what matters, and it is the one
-// number a real deployment tunes.
-let heartbeat_ms = 300;
-let election_timeout_ms = 1000;
+// Raft's one timing law is `heartbeat << election timeout << mean time between
+// failures`. The spread is what breaks split votes: if every node waited the
+// same time they would all become candidates together, split the vote, and do it
+// again forever. Randomising means someone almost always goes first.
+let heartbeat_ms = 150;
+let election_min_ms = 800;
+let election_spread_ms = 600;
+let tick_ms = 50;
 
-let bufsz = 4096;
+let bufsz = 1024;
 
-// ---- what a read returns ---------------------------------------------------
-// `tcp_read` hands back what read(2) did: a positive count, 0 at end of stream,
-// and -1 for everything else. With SO_RCVTIMEO set, "everything else" covers
-// both "the deadline passed" and "the connection broke", and the difference
-// between those two is exactly what this program exists to act on. Reading the
-// clock is how it tells them apart: a -1 that arrives early is an error, and a
-// -1 that arrives at the deadline is a timeout.
-//
-// That is a workaround, and PAIN.md keeps it as one. The honest shape is a
-// return type that says which happened.
-// (Named `recv_outcome`, not `wait`: a type called `wait` compiles to C that
-// collides with `union wait` in <sys/wait.h>, and the compiler's reserved-name
-// warning only looks at `let` names, never at `type` names. PAIN.md P1.)
-type recv_outcome = Heard of str | TimedOut of int | Gone;
+// ---- state -----------------------------------------------------------------
+type role = Follower | Candidate | Leader;
 
-let recv_line = fn (fd: int) -> fn (buf: int) -> fn (deadline_ms: int) ->
-  let started = now_ms () in
-  let n = tcp_read fd buf bufsz in
-  if n > 0 then Heard (mem_to_str buf n)
-  else if n == 0 then Gone
+type node = {
+  id: int,
+  term: int,
+  part: role,
+  voted_for: int,        // -1 when this node has not voted in `term`
+  votes: int,            // votes received as a candidate, including its own
+  deadline: int,         // now_ms() past which a follower calls an election
+  last_beat: int,        // when this node, as leader, last sent heartbeats
+  leader: int            // who it believes the leader is, -1 for nobody
+};
+
+// Every message carries the sender's term, because a term is how Raft compares
+// two nodes' views of history: the larger always wins, and a node that sees one
+// steps down. Every arm below starts by checking it.
+type event =
+    Tick
+  | RequestVote of (int * int)     // term, candidate id
+  | VoteGranted of (int * int)     // term, voter id
+  | Heartbeat of (int * int);      // term, leader id
+
+// ---- wire format -----------------------------------------------------------
+// One message per line, three space-separated fields. Text, because a protocol
+// that can be read with `nc` while it is failing is worth more here than one
+// that is compact.
+let encode = fn (tag: str) -> fn (a: int) -> fn (b: int) ->
+  tag ++ " " ++ str_of_int a ++ " " ++ str_of_int b ++ chr 10;
+
+let rec field_at = fn (s: str) -> fn (want: int) -> fn (i: int) -> fn (k: int) -> fn (acc: str) ->
+  if i >= str_len s then acc
   else
-    let waited = now_ms () - started in
-    // A timeout is a read that came back *after* having waited for one. Anything
-    // that fails faster than the deadline it was given failed for another
-    // reason, and calling that a timeout would be a lie the caller acts on.
-    if waited + 50 >= deadline_ms then TimedOut (waited) else Gone;
+    let c = substring s i (i + 1) in
+    if str_eq c " " then
+      (if k == want then acc else field_at s want (i + 1) (k + 1) "")
+    else if k == want then field_at s want (i + 1) k (acc ++ c)
+    else field_at s want (i + 1) k acc;
 
-// ---- follower --------------------------------------------------------------
-// Waits for heartbeats and reports the first gap longer than the election
-// timeout. A real follower would become a candidate here (M1); this one says
-// what it would do and stops, because a slice that stops at a named boundary is
-// easier to believe than one that keeps going into code nothing tests yet.
-let rec follow = fn (fd: int) -> fn (buf: int) -> fn (heard: int) ->
-  match recv_line fd buf election_timeout_ms with
-  | Heard (msg) ->
-    let _ = print ("follower: heartbeat " ++ str_of_int (heard + 1)
-                   ++ " <- " ++ msg) in
-    follow fd buf (heard + 1)
-  | TimedOut (waited) ->
-    let _ = print ("follower: no heartbeat for " ++ str_of_int waited
-                   ++ "ms (election timeout " ++ str_of_int election_timeout_ms
-                   ++ "ms) after " ++ str_of_int heard ++ " heartbeats") in
-    print "follower: would become a candidate here (M1)"
-  | Gone ->
-    // A peer whose *process* died gets here, not to TimedOut: the kernel sends
-    // a FIN on its behalf, so a crash is an orderly close as far as this socket
-    // is concerned. Silence is what a partition or a hung process looks like,
-    // and that is a different event with a different remedy. See PAIN.md P2.
-    print ("follower: leader closed the connection after "
-           ++ str_of_int heard ++ " heartbeats");
+let decode = fn (line: str) ->
+  let tag = field_at line 0 0 0 "" in
+  let a = int_of_str (field_at line 1 0 0 "") in
+  let b = int_of_str (field_at line 2 0 0 "") in
+  if str_eq tag "RV" then RequestVote (a, b)
+  else if str_eq tag "RVR" then VoteGranted (a, b)
+  else if str_eq tag "AE" then Heartbeat (a, b)
+  else Tick;                        // an unparseable line costs one wasted tick
 
-let run_follower = fn (port: int) ->
-  let srv = tcp_listen port in
-  if srv < 0 then
-    print_err ("mraft: could not listen on :" ++ str_of_int port)
+// ---- reading a peer's connection (one thread per accepted connection) ------
+let rec read_line = fn (fd: int) -> fn (scratch: int) -> fn (acc: str) ->
+  let n = tcp_read fd scratch 1 in
+  if n < 1 then ""                  // EOF or error: the caller closes
   else
-    let _ = print ("follower: listening on :" ++ str_of_int port) in
-    let fd = tcp_accept srv in
-    if fd < 0 then
-      print_err "mraft: accept failed"
+    let b = mem_get_u8 scratch 0 in
+    if b == 10 then acc
+    else read_line fd scratch (acc ++ chr b);
+
+let rec reader = fn (fd: int) -> fn (inbox) -> fn (scratch: int) ->
+  let line = read_line fd scratch "" in
+  if str_len line == 0 then tcp_close fd
+  else
+    let _ = channel_send inbox (decode line) in
+    reader fd inbox scratch;
+
+// ---- sending to one peer (one thread per peer) -----------------------------
+// The connection is made on demand and remade after a failure, so a peer that is
+// not up yet, or that dies and comes back, costs one dropped message rather than
+// a stalled cluster. Dropping is allowed: Raft's RPCs are best-effort, and the
+// election timeout is what turns a lost message back into progress.
+let rec sender = fn (port: int) -> fn (out_ch) -> fn (buf: int) -> fn (fd: int) ->
+  let m = channel_recv out_ch in
+  let live = if fd >= 0 then fd else tcp_connect "127.0.0.1" port in
+  if live < 0 then sender port out_ch buf (0 - 1)
+  else
+    let n = mem_copy_str buf 0 m in
+    let w = tcp_write live buf n in
+    if w < 0 then
+      let _ = tcp_close live in
+      sender port out_ch buf (0 - 1)
+    else sender port out_ch buf live;
+
+// Peers are (id, outbox) pairs rather than a bare list of channels, because a
+// vote has an addressee. Sending one to everybody is not a wasteful broadcast —
+// it is wrong: every candidate in that term counts it as a vote for itself, and
+// a three-node cluster elects two leaders in the same term. That is what this
+// program did until the invariant check in verify.sh caught it, and the happy
+// path had looked perfect.
+let rec broadcast = fn (outs) -> fn (m: str) ->
+  match outs with
+  | Nil -> ()
+  | Cons ((_, ch), rest) -> let _ = channel_send ch m in broadcast rest m;
+
+let rec send_to = fn (outs) -> fn (who: int) -> fn (m: str) ->
+  match outs with
+  | Nil -> ()                       // a peer we have no channel for: drop it
+  | Cons ((pid, ch), rest) ->
+    if pid == who then let _ = channel_send ch m in () else send_to rest who m;
+
+// ---- the node --------------------------------------------------------------
+let next_deadline = fn () ->
+  now_ms () + election_min_ms + random_int election_spread_ms;
+
+let name_of = fn (r: role) ->
+  match r with
+  | Follower -> "follower"
+  | Candidate -> "candidate"
+  | Leader -> "leader";
+
+// A node that learns of a term greater than its own is out of date, whatever it
+// was doing: it becomes a follower of that term and forgets its vote. This one
+// rule is what keeps two leaders from coexisting, and it is applied on every
+// message rather than in any one place.
+let step_down = fn (st: node) -> fn (t: int) ->
+  node { id = st.id, term = t, part = Follower, voted_for = 0 - 1, votes = 0,
+         deadline = next_deadline (), last_beat = st.last_beat, leader = 0 - 1 };
+
+let start_election = fn (st: node) -> fn (outs) -> fn (quorum: int) ->
+  let t = st.term + 1 in
+  let _ = print ("node " ++ str_of_int st.id ++ ": election timeout, standing for term "
+                 ++ str_of_int t) in
+  let _ = broadcast outs (encode "RV" t st.id) in
+  // A candidate votes for itself. That is also why two candidates in one term
+  // deadlock until one of them times out again — with a different random
+  // deadline, which is the whole reason the deadline is random.
+  if 1 >= quorum then
+    let _ = print ("node " ++ str_of_int st.id ++ ": became leader for term "
+                   ++ str_of_int t ++ " with 1 votes") in
+    node { id = st.id, term = t, part = Leader, voted_for = st.id, votes = 1,
+           deadline = next_deadline (), last_beat = 0, leader = st.id }
+  else
+    node { id = st.id, term = t, part = Candidate, voted_for = st.id, votes = 1,
+           deadline = next_deadline (), last_beat = st.last_beat, leader = 0 - 1 };
+
+let on_tick = fn (st: node) -> fn (outs) -> fn (quorum: int) ->
+  let now = now_ms () in
+  match st.part with
+  | Leader ->
+    if now >= st.last_beat + heartbeat_ms then
+      let _ = broadcast outs (encode "AE" st.term st.id) in
+      node { id = st.id, term = st.term, part = Leader, voted_for = st.voted_for,
+             votes = st.votes, deadline = st.deadline, last_beat = now,
+             leader = st.leader }
+    else st
+  | Follower -> if now >= st.deadline then start_election st outs quorum else st
+  | Candidate -> if now >= st.deadline then start_election st outs quorum else st;
+
+let on_request_vote = fn (st: node) -> fn (outs) -> fn (t: int) -> fn (cand: int) ->
+  let st1 = if t > st.term then step_down st t else st in
+  // At most one vote per term, and only for a candidate whose term is current.
+  // The `voted_for == cand` case matters because a retried RequestVote has to
+  // get the same answer as the first one.
+  if t == st1.term && (st1.voted_for == 0 - 1 || st1.voted_for == cand) then
+    let _ = send_to outs cand (encode "RVR" t st1.id) in
+    let _ = print ("node " ++ str_of_int st1.id ++ ": voted for " ++ str_of_int cand
+                   ++ " in term " ++ str_of_int t) in
+    node { id = st1.id, term = st1.term, part = st1.part, voted_for = cand,
+           votes = st1.votes, deadline = next_deadline (), last_beat = st1.last_beat,
+           leader = st1.leader }
+  else st1;
+
+let on_vote_granted = fn (st: node) -> fn (outs) -> fn (t: int) -> fn (quorum: int) ->
+  let st1 = if t > st.term then step_down st t else st in
+  match st1.part with
+  | Candidate ->
+    if t == st1.term then
+      let v = st1.votes + 1 in
+      if v >= quorum then
+        let _ = print ("node " ++ str_of_int st1.id ++ ": became leader for term "
+                       ++ str_of_int st1.term ++ " with " ++ str_of_int v ++ " votes") in
+        let _ = broadcast outs (encode "AE" st1.term st1.id) in
+        node { id = st1.id, term = st1.term, part = Leader, voted_for = st1.voted_for,
+               votes = v, deadline = next_deadline (), last_beat = now_ms (),
+               leader = st1.id }
+      else
+        node { id = st1.id, term = st1.term, part = Candidate, voted_for = st1.voted_for,
+               votes = v, deadline = st1.deadline, last_beat = st1.last_beat,
+               leader = st1.leader }
+    else st1
+  | Follower -> st1
+  | Leader -> st1;
+
+let on_heartbeat = fn (st: node) -> fn (t: int) -> fn (leader: int) ->
+  // A leader that hears from another leader of its OWN term is looking at a
+  // broken invariant, not at news: stepping down would make each of the two
+  // demote the other, which is what happened here before votes were addressed.
+  // Only a strictly greater term unseats a leader. A candidate, on the other
+  // hand, must yield to an equal term — that is someone having won the election
+  // it is still running.
+  let stale = if t < st.term then true
+              else match st.part with
+                   | Leader -> t == st.term
+                   | Follower -> false
+                   | Candidate -> false in
+  if stale then st
+  else
+    let _ =
+      if st.leader == leader && st.term == t then ()
+      else print ("node " ++ str_of_int st.id ++ ": following " ++ str_of_int leader
+                  ++ " in term " ++ str_of_int t ++ " (was " ++ name_of st.part ++ ")") in
+    node { id = st.id, term = t, part = Follower,
+           voted_for = if t > st.term then 0 - 1 else st.voted_for,
+           votes = 0, deadline = next_deadline (), last_beat = st.last_beat,
+           leader = leader };
+
+let rec run = fn (st: node) -> fn (inbox) -> fn (outs) -> fn (quorum: int) ->
+  let st2 =
+    match channel_recv inbox with
+    | Tick -> on_tick st outs quorum
+    | RequestVote (t, cand) -> on_request_vote st outs t cand
+    | VoteGranted (t, _) -> on_vote_granted st outs t quorum
+    | Heartbeat (t, leader) -> on_heartbeat st t leader in
+  run st2 inbox outs quorum;
+
+// ---- wiring ----------------------------------------------------------------
+// The byte arena is a bump allocator with no free and is not thread-safe, so
+// every buffer any thread will ever use is carved here, before anything is
+// spawned — the rule `mkv` found. Readers borrow a slot from a channel and
+// return it when their connection closes, which also caps how many peers can be
+// talking at once.
+let reader_slots = 8;
+
+let rec fill = fn (ch) -> fn (i: int) ->
+  if i >= reader_slots then () else let _ = channel_send ch i in fill ch (i + 1);
+
+let rec acceptor = fn (srv: int) -> fn (inbox) -> fn (free_ch) -> fn (base: int) ->
+  let c = tcp_accept srv in
+  if c < 0 then acceptor srv inbox free_ch base
+  else
+    let slot = channel_recv free_ch in
+    let _ = spawn (fn () ->
+      let _ = reader c inbox (base + slot * bufsz) in
+      channel_send free_ch slot) in
+    acceptor srv inbox free_ch base;
+
+let rec ticker = fn (inbox) ->
+  let _ = sleep_ms tick_ms in
+  let _ = channel_send inbox Tick in
+  ticker inbox;
+
+// The cluster is given as every port in node-id order, so a peer's id is its
+// position in that list. Ids and ports travel together from here on, because a
+// vote has an addressee and the wire only carries ids.
+let rec pairs_of = fn (ports: int list) -> fn (k: int) ->
+  match ports with
+  | Nil -> Nil
+  | Cons (p, rest) -> Cons ((k, p), pairs_of rest (k + 1));
+
+let rec without = fn (ps) -> fn (mine: int) ->
+  match ps with
+  | Nil -> Nil
+  | Cons ((i, p), rest) ->
+    if p == mine then without rest mine else Cons ((i, p), without rest mine);
+
+// One sender thread per peer, each with its own outbox and write buffer.
+let rec start_senders = fn (ps) -> fn (base: int) -> fn (k: int) -> fn (acc) ->
+  match ps with
+  | Nil -> acc
+  | Cons ((pid, p), rest) ->
+    let out = channel_new () in
+    let buf = base + k * bufsz in
+    // `(p : int)` is not documentation. Without it the Send check refuses the
+    // capture with "cannot capture `p` of unknown type across a thread
+    // boundary", even though the list it came from is annotated — the check runs
+    // before that has reached the pattern variable. PAIN.md P5.
+    let peer_port = (p : int) in
+    let peer_id = (pid : int) in
+    let _ = spawn (fn () -> sender peer_port out buf (0 - 1)) in
+    start_senders rest base (k + 1) (Cons ((peer_id, out), acc));
+
+let rec ints_of = fn (xs: str list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (h, t) -> Cons (int_of_str h, ints_of t);
+
+let rec length_of = fn (xs: int list) ->
+  match xs with
+  | Nil -> 0
+  | Cons (_, t) -> 1 + length_of t;
+
+let rec index_of = fn (xs: int list) -> fn (want: int) -> fn (k: int) ->
+  match xs with
+  | Nil -> 0 - 1
+  | Cons (h, t) -> if h == want then k else index_of t want (k + 1);
+
+let start = fn (id: int) -> fn (my_port: int) -> fn (ports: int list) ->
+  let cluster = length_of ports in
+  let mine = index_of ports my_port 1 in
+  if mine < 0 then
+    print_err ("mraft: my port " ++ str_of_int my_port
+               ++ " is not in the cluster list")
+  else if mine != id then
+    // Ids are positions, so an id that disagrees with the port order would make
+    // two nodes answer to the same name and every vote go to the wrong place.
+    print_err ("mraft: node id " ++ str_of_int id ++ " does not match position "
+               ++ str_of_int mine ++ " of port " ++ str_of_int my_port
+               ++ " in the cluster list")
+  else
+    let srv = tcp_listen my_port in
+    if srv < 0 then
+      print_err ("mraft: could not listen on :" ++ str_of_int my_port)
     else
-      let _ = print "follower: leader connected" in
-      // The deadline lives on the socket, not in the loop: SO_RCVTIMEO is the
-      // only bounded wait the runtime has, so every wait in this program has to
-      // be a socket read. That constraint shapes the design more than anything
-      // in Raft does — see PAIN.md.
-      let _ = tcp_set_timeout fd election_timeout_ms in
-      let buf = mem_alloc bufsz in
-      follow fd buf 0;
+      let quorum = cluster / 2 + 1 in
+      let _ = print ("node " ++ str_of_int id ++ ": listening on :" ++ str_of_int my_port
+                     ++ ", cluster of " ++ str_of_int cluster
+                     ++ ", quorum " ++ str_of_int quorum) in
+      let peers = without (pairs_of ports 1) my_port in
+      let inbox = channel_new () in
+      let free_ch = channel_new () in
+      // Reader slots first, then one write buffer per peer.
+      let base = mem_alloc ((reader_slots + cluster) * bufsz) in
+      let _ = fill free_ch 0 in
+      let outs = start_senders peers (base + reader_slots * bufsz) 0 Nil in
+      let _ = spawn (fn () -> acceptor srv inbox free_ch base) in
+      let _ = spawn (fn () -> ticker inbox) in
+      run (node { id = id, term = 0, part = Follower, voted_for = 0 - 1, votes = 0,
+                  deadline = next_deadline (), last_beat = 0, leader = 0 - 1 })
+          inbox outs quorum;
 
-// ---- leader ----------------------------------------------------------------
-// Sends heartbeats forever at a fixed interval. Killing it is the test.
-let rec beat = fn (fd: int) -> fn (buf: int) -> fn (n: int) ->
-  let msg = "heartbeat term=1 n=" ++ str_of_int n in
-  let len = mem_copy_str buf 0 msg in
-  let w = tcp_write fd buf len in
-  if w < 0 then
-    print "leader: follower is gone"
-  else
-    let _ = print ("leader: sent " ++ msg) in
-    let _ = sleep_ms heartbeat_ms in
-    beat fd buf (n + 1);
-
-let run_leader = fn (port: int) ->
-  let fd = tcp_connect "127.0.0.1" port in
-  if fd < 0 then
-    print_err ("mraft: could not connect to :" ++ str_of_int port)
-  else
-    let _ = print ("leader: connected to :" ++ str_of_int port) in
-    let buf = mem_alloc bufsz in
-    beat fd buf 0;
-
-// ---- main ------------------------------------------------------------------
 let main = fn () ->
   match args () with
-  | Cons (role, Cons (port_s, _)) ->
-    let port = int_of_str port_s in
-    if str_eq role "follower" then run_follower port
-    else if str_eq role "leader" then run_leader port
-    else print_err ("mraft: unknown role '" ++ role ++ "'")
+  | Cons (id_s, Cons (port_s, rest)) ->
+    let id = int_of_str id_s in
+    let my_port = int_of_str port_s in
+    let ports = ints_of rest in
+    (match ports with
+     | Nil -> print "usage: mraft <id> <my-port> <port>... (every port in the cluster)"
+     | Cons (_, _) -> start id my_port ports)
   | _ ->
-    print "usage: mraft <follower|leader> <port>";
+    print "usage: mraft <id> <my-port> <port>... (every port in the cluster)";
 
 main ()

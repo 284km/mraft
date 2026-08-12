@@ -1,32 +1,28 @@
 #!/bin/sh
-# verify.sh — start two nodes, break one, and check that the other notices.
+# verify.sh — run a three-node cluster, break it, and check what it decides.
 #
 # Every other dogfood's test asks whether the right answer came back. This one
-# asks whether the *absence* of an answer was detected, and within the time it
-# was supposed to be detected in — so the subject is a failure, and the test has
-# to cause it.
+# asks what a cluster concludes when a message does not arrive, so the subject is
+# a failure and the test has to cause it.
 #
-# The three ways a leader can stop being useful are not the same event, and the
-# first thing this repository learned is that they arrive differently:
+# How you break a node decides what you are testing, and the two are not the same
+# event:
 #
-#   still running       data keeps coming            stay a follower
 #   stopped (SIGSTOP)   silence, socket still open   election timeout
-#   killed (SIGKILL)    the kernel sends FIN for it  an orderly close
+#   killed (SIGKILL)    the kernel sends FIN for it  an immediate close
 #
-# A crashed process is *not* a partition. Only the middle one is what an
-# election timeout is for, which is why the timeout case has to be produced with
-# SIGSTOP: `kill -9` tests a different code path, and a test that used it would
-# pass while measuring nothing.
+# A crashed process is *not* a partition. Both eventually produce an election
+# here, but only SIGSTOP produces one by way of the timeout that exists for it —
+# a test that used `kill -9` would pass while measuring something else.
 #
 #   sh verify.sh
 #
 # MERE=/path/to/mere overrides the compiler.
 
 set -e
+
 MERE=${MERE:-mere}
-PORT=${PORT:-7099}
-ELECTION_MS=1000            # must match election_timeout_ms in mraft.mere
-HEARTBEAT_MS=300            # must match heartbeat_ms
+BASE=${BASE:-7310}
 
 pass=0
 fail=0
@@ -34,11 +30,13 @@ ok()  { printf '  ok    %s\n' "$1"; pass=$((pass + 1)); }
 bad() { printf '  FAIL  %s\n' "$1"; fail=$((fail + 1)); }
 
 TMP=$(mktemp -d)
-LEADER_PID=
-FOLLOWER_PID=
 cleanup() {
-  [ -n "$LEADER_PID" ] && { kill -CONT "$LEADER_PID" 2>/dev/null; kill -9 "$LEADER_PID" 2>/dev/null; }
-  [ -n "$FOLLOWER_PID" ] && kill -9 "$FOLLOWER_PID" 2>/dev/null
+  for f in "$TMP"/*.pid; do
+    [ -f "$f" ] || continue
+    p=$(cat "$f")
+    kill -CONT "$p" 2>/dev/null || true
+    kill -9 "$p" 2>/dev/null || true
+  done
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -46,122 +44,145 @@ trap cleanup EXIT
 "$MERE" -c mraft.mere > "$TMP/m.c"
 clang -O2 -w "$TMP/m.c" -o "$TMP/mraft"
 
-# Start a follower and a leader talking to it. $1 names the log pair.
-# Both nodes are started from a subshell that exits immediately, so this shell
-# has no job to announce when they are killed on purpose further down — the
-# results should read as results, not be interleaved with "Killed: 9".
-spawn_node() {   # spawn_node <role> <port> <logfile> <pidfile>
-  ( "$TMP/mraft" "$1" "$2" > "$3" 2>&1 & echo $! > "$4" ) &
+P1=$BASE
+P2=$((BASE + 1))
+P3=$((BASE + 2))
+
+# Started from a subshell that exits immediately, so this shell has no job to
+# announce when a node is stopped or killed on purpose below.
+start_node() {   # start_node <id> <port>
+  ( "$TMP/mraft" "$1" "$2" "$P1" "$P2" "$P3" > "$TMP/n$1.log" 2>&1 &
+    echo $! > "$TMP/n$1.pid" ) &
   wait $!
-  cat "$4"
 }
 
-start_pair() {
-  PORT=$((PORT + 1))
-  FOLLOWER_PID=$(spawn_node follower "$PORT" "$TMP/$1.follower" "$TMP/f.pid")
-  sleep 0.4                                 # let it reach accept()
-  LEADER_PID=$(spawn_node leader "$PORT" "$TMP/$1.leader" "$TMP/l.pid")
-}
-
-# Wait up to $2 tenths of a second for $1 to appear in file $3.
-wait_for() {
+wait_any() {     # wait_any <pattern> <tenths>
   i=0
   while [ "$i" -lt "$2" ]; do
-    grep -q "$1" "$3" && return 0
+    grep -qh "$1" "$TMP"/n*.log 2>/dev/null && return 0
     sleep 0.1
     i=$((i + 1))
   done
   return 1
 }
 
-# --- 1. a live leader keeps the follower a follower -------------------------
-start_pair live
-sleep 1.5      # several heartbeats, and past the election timeout
+# The highest term any node has claimed. Not the last line: grep over several
+# files walks them in filename order, not in time order, so `tail -1` returns
+# whatever node 3 said last rather than what happened last — which made this
+# test stop the wrong node and then wait 10s for a leader that already existed.
+max_term() {
+  grep -h 'became leader for term' "$TMP"/n*.log 2>/dev/null \
+    | sed -n 's/.*term \([0-9]*\) .*/\1/p' | sort -n | tail -1
+}
 
-if grep -q 'heartbeat 3' "$TMP/live.follower"; then
-  ok "follower hears heartbeats from a live leader"
+leader_of() {    # leader_of <term> -> the id(s) that claimed it
+  grep -h "became leader for term $1 " "$TMP"/n*.log 2>/dev/null \
+    | sed -n 's/^node \([0-9]*\):.*/\1/p'
+}
+
+start_node 1 "$P1"
+start_node 2 "$P2"
+start_node 3 "$P3"
+
+# --- 1. a leader emerges, and only one --------------------------------------
+if wait_any 'became leader' 60; then
+  ok "the cluster elects a leader"
 else
-  bad "follower did not log 3 heartbeats"; cat "$TMP/live.follower"
+  bad "no leader after 6s"; cat "$TMP"/n*.log
 fi
 
-if grep -q 'no heartbeat for' "$TMP/live.follower"; then
-  bad "follower timed out while the leader was still sending"
+sleep 1.5     # let the term settle and heartbeats flow
+
+term=$(max_term)
+leader=$(leader_of "$term")
+count=$(printf '%s\n' "$leader" | grep -c '[0-9]' || true)
+
+if [ "$count" = 1 ]; then
+  ok "exactly one node claimed term $term (node $leader)"
 else
-  ok "follower does not time out while the leader is alive"
+  bad "$count nodes claimed term $term: $(printf '%s' "$leader" | tr '\n' ' ')"
 fi
 
-# --- 2. a stopped leader is silence, and silence is the election timeout -----
-# SIGSTOP freezes the process without closing anything: the socket stays open,
-# the kernel sends nothing, and the follower is left waiting — which is what a
-# partition or a hung peer looks like from the other end.
-kill -STOP "$LEADER_PID" || true
+followers=$(grep -h "following $leader in term $term" "$TMP"/n*.log | wc -l | tr -d ' ')
+if [ "$followers" -ge 2 ]; then
+  ok "the other two nodes follow node $leader in term $term"
+else
+  bad "only $followers node(s) followed node $leader"; cat "$TMP"/n*.log
+fi
+
+# --- 2. the leader goes silent; the survivors elect another ------------------
+kill -STOP "$(cat "$TMP/n$leader.pid")"
 stopped_at=$(date +%s)
 
-if wait_for 'no heartbeat for' 30 "$TMP/live.follower"; then
-  ok "a stopped leader is noticed as an election timeout"
-else
-  bad "follower never timed out on a silent leader"; cat "$TMP/live.follower"
-fi
+i=0
+newterm=
+while [ "$i" -lt 80 ]; do
+  newterm=$(max_term)
+  [ -n "$newterm" ] && [ "$newterm" -gt "$term" ] && break
+  sleep 0.1
+  i=$((i + 1))
+done
 noticed_at=$(date +%s)
 
-reported=$(sed -n 's/.*no heartbeat for \([0-9]*\)ms.*/\1/p' "$TMP/live.follower" | head -1)
-if [ -n "$reported" ]; then
-  low=$((ELECTION_MS - HEARTBEAT_MS))
-  high=$((ELECTION_MS * 2))
-  if [ "$reported" -ge "$low" ] && [ "$reported" -le "$high" ]; then
-    ok "the gap it measured (${reported}ms) is within [${low}, ${high}]ms"
-  else
-    bad "measured gap ${reported}ms is outside [${low}, ${high}]ms"
-  fi
+if [ -n "$newterm" ] && [ "$newterm" -gt "$term" ]; then
+  ok "a silent leader is replaced (term $term -> $newterm)"
 else
-  bad "follower reported no gap length"
+  bad "no new leader after the leader went silent"; cat "$TMP"/n*.log
+fi
+
+newleader=$(leader_of "$newterm")
+if [ -n "$newleader" ] && [ "$newleader" != "$leader" ]; then
+  ok "the new leader is a different node (node $newleader)"
+else
+  bad "new leader was '$newleader', expected someone other than $leader"
 fi
 
 elapsed=$((noticed_at - stopped_at))
-if [ "$elapsed" -le 3 ]; then
-  ok "noticed within ${elapsed}s of the leader going silent"
+if [ "$elapsed" -le 5 ]; then
+  ok "replaced within ${elapsed}s of the leader going silent"
 else
-  bad "took ${elapsed}s to notice silence, expected under 3s"
+  bad "took ${elapsed}s to replace a silent leader"
 fi
 
-if grep -q 'would become a candidate' "$TMP/live.follower"; then
-  ok "follower says what it would do next"
+# --- 3. safety: no term ever has two leaders --------------------------------
+# This is the property Raft exists to provide, and the first thing a bug in the
+# term rules would break. It is checked over the whole run, not at a moment.
+dupes=$(grep -h 'became leader for term' "$TMP"/n*.log \
+        | sed -n 's/.*term \([0-9]*\) .*/\1/p' | sort | uniq -d | tr '\n' ' ')
+if [ -z "$dupes" ]; then
+  ok "no term was ever claimed by two leaders"
 else
-  bad "follower did not reach the candidate boundary"
+  bad "two leaders in term(s): $dupes"
+  grep -h 'became leader for term' "$TMP"/n*.log
 fi
 
-kill -CONT "$LEADER_PID" 2>/dev/null || true; kill -9 "$LEADER_PID" 2>/dev/null || true; LEADER_PID=
-# The follower exits on its own after reporting, so killing it may well fail.
-kill -9 "$FOLLOWER_PID" 2>/dev/null || true; FOLLOWER_PID=
+# --- 4. the frozen leader comes back and finds it is stale ------------------
+# It still believes it is leader of the old term. The first message from the new
+# term has to make it step down: this is the rule that makes a healed partition
+# converge instead of producing two leaders.
+kill -CONT "$(cat "$TMP/n$leader.pid")"
 
-# --- 3. a killed leader is a close, not a timeout ---------------------------
-start_pair killed
-if ! wait_for 'heartbeat 2' 30 "$TMP/killed.follower"; then
-  bad "follower did not hear from the second leader"; cat "$TMP/killed.follower"
-fi
+i=0
+while [ "$i" -lt 60 ]; do
+  grep -q "following" "$TMP/n$leader.log" && break
+  sleep 0.1
+  i=$((i + 1))
+done
 
-kill -9 "$LEADER_PID" || true; LEADER_PID=
-
-if wait_for 'closed the connection' 30 "$TMP/killed.follower"; then
-  ok "a killed leader arrives as a close (the kernel sends FIN for it)"
+if grep -q "following" "$TMP/n$leader.log"; then
+  ok "the revived leader steps down and follows again"
 else
-  if grep -q 'no heartbeat for' "$TMP/killed.follower"; then
-    bad "a killed leader was reported as an election timeout"
-  else
-    bad "follower said nothing about the killed leader"
-  fi
-  cat "$TMP/killed.follower"
+  bad "the revived node did not step down"; tail -5 "$TMP/n$leader.log"
 fi
 
-# It must not have waited an election timeout to find out: a close is immediate
-# information, and treating it as silence would delay every crash by a timeout.
-if grep -q 'no heartbeat for' "$TMP/killed.follower"; then
-  bad "follower also reported a timeout for a close"
+# And it must not have carried on leading its old term: whatever it does next
+# happens in a term at least as new as the one elected without it.
+stale=$(grep -h "became leader for term $term " "$TMP/n$leader.log" | wc -l | tr -d ' ')
+if [ "$stale" -le 1 ]; then
+  ok "and it did not re-claim its old term"
 else
-  ok "and it did not also call that a timeout"
+  bad "the revived node claimed term $term again"
 fi
-
-kill -9 "$FOLLOWER_PID" 2>/dev/null || true; FOLLOWER_PID=
 
 echo "verify: $pass passed, $fail failed"
 [ "$fail" = 0 ]
