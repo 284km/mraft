@@ -48,7 +48,7 @@ So the question this repository asks is not "can Mere express Raft" — it is an
 ML-family language with variants and pattern matching, and the answer is
 obviously yes. The question is what the language does about **waiting, giving up,
 and saying why**. [PAIN.md](PAIN.md) is the answer as it accumulates; it has
-already sent one fix upstream.
+already sent two fixes upstream.
 
 ## Where it is
 
@@ -80,7 +80,17 @@ log full of earlier terms could never commit any of it, because committing on a
 replica count is only safe for the current term. A leader now appends one no-op of
 its own on election, which commits and carries everything before it.
 
-Next: M4 (message loss and reordering, injected on purpose).
+**M4 — an adversarial network.** `--chaos <pct>` gives each outbound peer message an
+independent chance of being **dropped**, **duplicated**, and **held back to travel
+behind the next one**. Loopback TCP hands over none of those, so a protocol that only
+ever ran there had never been asked the question. At 25% the cluster still elects,
+commits and agrees; at 45% safety holds and liveness degrades, which is the correct
+trade.
+
+Next: a client protocol. `PROP` gets no reply, so a client cannot tell a committed
+command from one that was accepted by a leader that then died — see PAIN.md P8. That
+is the difference between "the cluster agrees on an order" and "my write landed
+exactly once".
 
 ## How it is built
 
@@ -127,14 +137,15 @@ is that *how* you kill it decides what you are testing:
 | killed (`SIGKILL`) | the kernel sends FIN for it | an immediate close |
 | killed, and its `.wal` deleted | it comes back empty | the leader refills it |
 | all three killed | nothing is left running | disk is the only memory |
+| `--chaos 25` | a quarter of peer messages lie | it still agrees |
 
 **A crashed process is not a partition.** Only the second row is what an election
 timeout exists for; a crash is immediate information. The first version of the
 test used `kill -9`, passed, and measured nothing.
 
-The last row is the one that found the most: a majority surviving is exactly what
-hides a leader's inability to commit what it inherited, so the bug only appears
-when nothing survives.
+**Killing all three found the most.** A majority surviving is exactly what hides a
+leader's inability to commit entries it inherited from an earlier term, so that bug
+only appears when nothing survives to feed it a fresh one.
 
 The checks that earn their place are the two invariants, asserted over the whole
 run rather than at a moment:

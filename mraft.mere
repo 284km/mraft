@@ -186,17 +186,43 @@ let rec reader = fn (fd: int) -> fn (inbox) -> fn (scratch: int) ->
 // a stalled cluster. Dropping is allowed: Raft's RPCs are best-effort, and the
 // election timeout and the next heartbeat are what turn a lost message back into
 // progress.
+//
+// M4: `--chaos <pct>` makes that claim testable instead of merely stated. Each
+// outbound message independently gets, with probability `pct`:
+//
+//   dropped      never written, and nothing tells the other end
+//   duplicated   written twice, so every handler must be idempotent
+//   held back    kept and sent after the next one, so order is not a given
+//
+// TCP gives none of these away on a single connection, which is exactly why a
+// protocol that only ever ran over localhost TCP has never been asked the
+// question. The three faults live in the sender thread because that is the only
+// place a message can be interfered with without the rest of the program being
+// able to tell — a fault injector the program can detect is not testing anything.
 let rec sender = fn (port: int) -> fn (out_ch) -> fn (buf: int) -> fn (fd: int) ->
+                 fn (chaos: int) -> fn (held: str) ->
   let m = channel_recv out_ch in
-  let live = if fd >= 0 then fd else tcp_connect "127.0.0.1" port in
-  if live < 0 then sender port out_ch buf (0 - 1)
+  let roll = fn () -> if chaos <= 0 then 100 else random_int 100 in
+  if roll () < chaos then
+    // Dropped. The held message stays held: a lost message must not shake loose
+    // whatever was already waiting, or "dropped" would quietly mean "delayed".
+    sender port out_ch buf fd chaos held
+  else if str_len held == 0 && roll () < chaos then
+    sender port out_ch buf fd chaos m       // held back, to go out after the next
   else
-    let n = mem_copy_str buf 0 m in
-    let w = tcp_write live buf n in
-    if w < 0 then
-      let _ = tcp_close live in
-      sender port out_ch buf (0 - 1)
-    else sender port out_ch buf live;
+    let live = if fd >= 0 then fd else tcp_connect "127.0.0.1" port in
+    if live < 0 then sender port out_ch buf (0 - 1) chaos held
+    else
+      // The newer message first, then whatever was held: that is what makes the
+      // reordering visible rather than a uniform delay.
+      let dup = roll () < chaos in
+      let out = m ++ (if dup then m else "") ++ held in
+      let n = mem_copy_str buf 0 out in
+      let w = tcp_write live buf n in
+      if w < 0 then
+        let _ = tcp_close live in
+        sender port out_ch buf (0 - 1) chaos held
+      else sender port out_ch buf live chaos "";
 
 // Peers are (id, outbox) pairs rather than a bare list of channels, because a
 // vote has an addressee. Sending one to everybody is not a wasteful broadcast —
@@ -616,7 +642,7 @@ let rec without = fn (ps) -> fn (mine: int) ->
     if p == mine then without rest mine else Cons ((i, p), without rest mine);
 
 // One sender thread per peer, each with its own outbox and write buffer.
-let rec start_senders = fn (ps) -> fn (base: int) -> fn (k: int) -> fn (acc) ->
+let rec start_senders = fn (ps) -> fn (base: int) -> fn (k: int) -> fn (chaos: int) -> fn (acc) ->
   match ps with
   | Nil -> acc
   | Cons ((pid, p), rest) ->
@@ -628,8 +654,8 @@ let rec start_senders = fn (ps) -> fn (base: int) -> fn (k: int) -> fn (acc) ->
     // has reached the pattern variable. PAIN.md P5.
     let peer_port = (p : int) in
     let peer_id = (pid : int) in
-    let _ = spawn (fn () -> sender peer_port out buf (0 - 1)) in
-    start_senders rest base (k + 1) (Cons ((peer_id, out), acc));
+    let _ = spawn (fn () -> sender peer_port out buf (0 - 1) chaos "") in
+    start_senders rest base (k + 1) chaos (Cons ((peer_id, out), acc));
 
 let rec peer_slots = fn (ps) ->
   match ps with
@@ -657,7 +683,7 @@ let rec index_of = fn (xs: int list) -> fn (want: int) -> fn (k: int) ->
   | Nil -> 0 - 1
   | Cons (h, t) -> if h == want then k else index_of t want (k + 1);
 
-let start = fn (id: int) -> fn (my_port: int) -> fn (ports: int list) ->
+let start = fn (id: int) -> fn (my_port: int) -> fn (ports: int list) -> fn (chaos: int) ->
   let cluster = length_of ports in
   let mine = index_of ports my_port 1 in
   if mine < 0 then
@@ -677,14 +703,18 @@ let start = fn (id: int) -> fn (my_port: int) -> fn (ports: int list) ->
       let quorum = cluster / 2 + 1 in
       let _ = print ("node " ++ str_of_int id ++ ": listening on :" ++ str_of_int my_port
                      ++ ", cluster of " ++ str_of_int cluster
-                     ++ ", quorum " ++ str_of_int quorum) in
+                     ++ ", quorum " ++ str_of_int quorum
+                     ++ (if chaos > 0 then
+                           ", chaos " ++ str_of_int chaos
+                           ++ "% (drop / duplicate / reorder, per message)"
+                         else "")) in
       let peer_list = without (pairs_of ports 1) my_port in
       let inbox = channel_new () in
       let free_ch = channel_new () in
       // Reader slots first, then one write buffer per peer.
       let base = mem_alloc ((reader_slots + cluster) * bufsz) in
       let _ = fill free_ch 0 in
-      let outs = start_senders peer_list (base + reader_slots * bufsz) 0 Nil in
+      let outs = start_senders peer_list (base + reader_slots * bufsz) 0 chaos Nil in
       let _ = spawn (fn () -> acceptor srv inbox free_ch base) in
       let _ = spawn (fn () -> ticker inbox) in
       // Recovery happens before anything is served: a node that answered a vote
@@ -714,16 +744,35 @@ let start = fn (id: int) -> fn (my_port: int) -> fn (ports: int list) ->
                     wal = h, wal_end = str_len text })
             inbox outs quorum;
 
+// `--chaos <pct>` may appear anywhere after the ports; everything else is a port.
+let rec chaos_arg = fn (xs: str list) ->
+  match xs with
+  | Nil -> 0
+  | Cons (h, t) ->
+    if str_eq h "--chaos" then
+      (match t with Cons (v, _) -> int_of_str v | Nil -> 0)
+    else chaos_arg t;
+
+let rec drop_flags = fn (xs: str list) -> fn (skip_one: bool) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (h, t) ->
+    if skip_one then drop_flags t false
+    else if str_eq h "--chaos" then drop_flags t true
+    else Cons (h, drop_flags t false);
+
+let usage = "usage: mraft <id> <my-port> <port>... [--chaos <pct>]";
+
 let main = fn () ->
   match args () with
   | Cons (id_s, Cons (port_s, rest)) ->
     let id = int_of_str id_s in
     let my_port = int_of_str port_s in
-    let ports = ints_of rest in
+    let chaos = chaos_arg rest in
+    let ports = ints_of (drop_flags rest false) in
     (match ports with
-     | Nil -> print "usage: mraft <id> <my-port> <port>... (every port in the cluster)"
-     | Cons (_, _) -> start id my_port ports)
-  | _ ->
-    print "usage: mraft <id> <my-port> <port>... (every port in the cluster)";
+     | Nil -> print usage
+     | Cons (_, _) -> start id my_port ports chaos)
+  | _ -> print usage;
 
 main ()

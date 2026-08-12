@@ -46,7 +46,7 @@ bad() { printf '  FAIL  %s\n' "$1"; fail=$((fail + 1)); }
 
 TMP=$(mktemp -d)
 cleanup() {
-  for f in "$TMP"/*.pid; do
+  for f in "$TMP"/*.pid "$TMP"/chaos/*.pid; do
     [ -f "$f" ] || continue
     p=$(cat "$f")
     kill -CONT "$p" 2>/dev/null || true
@@ -364,7 +364,136 @@ else
   bad "unexpected commands appeared: $strays"
 fi
 
-# --- 9. the invariants, over the whole run ----------------------------------
+# --- 9. the same invariants, over a network that loses and reorders ----------
+# Everything above ran over loopback TCP, which delivers in order, exactly once, or
+# not at all. Raft is specified against a network that does none of that, and until
+# now this program's tolerance of loss was a claim rather than a result.
+#
+# `--chaos 25` gives each outbound peer message an independent 25% chance of being
+# dropped, of being duplicated, and of being held back to travel behind the next
+# one. Client connections are untouched, so a proposal that is accepted was really
+# accepted; it is the consensus traffic that is unreliable.
+#
+# What is asserted is what Raft actually promises: **the nodes agree**. Not
+# exactly-once — a command sent to a cluster whose leader changes mid-send can be
+# accepted twice, and de-duplicating that needs client ids and sequence numbers,
+# which is a different feature at a different layer. So the checks are agreement,
+# presence, and first-occurrence order.
+CH="$TMP/chaos"
+mkdir -p "$CH"
+cp "$TMP/mraft" "$CH/mraft"
+
+C1=$((BASE + 10))
+C2=$((BASE + 11))
+C3=$((BASE + 12))
+
+start_chaos_node() {   # start_chaos_node <id> <port>
+  ( ( cd "$CH"; exec ./mraft "$1" "$2" "$C1" "$C2" "$C3" --chaos 25 \
+        > "$CH/c$1.log" 2>&1 ) &
+    echo $! > "$CH/c$1.pid" ) &
+  wait $!
+}
+
+chaos_commands_of() {  # chaos_commands_of <id>
+  sed -n 's/^node [0-9]*: applied [0-9]* term=[0-9]* cmd=\(.*\)$/\1/p' \
+    "$CH/c$1.log" 2>/dev/null | grep -v '^<noop>$' | tr "\n" " "
+}
+
+for i in 1 2 3; do start_chaos_node "$i" "$((BASE + 9 + i))"; done
+
+i=0
+while [ "$i" -lt 100 ]; do
+  grep -qh 'became leader' "$CH"/c*.log 2>/dev/null && break
+  sleep 0.1
+  i=$((i + 1))
+done
+if grep -qh 'became leader' "$CH"/c*.log 2>/dev/null; then
+  ok "a leader is elected even with a quarter of the messages misbehaving"
+else
+  bad "no leader under chaos after 10s"; cat "$CH"/c*.log
+fi
+
+# One command at a time, offered to every node — only the leader accepts — and then
+# waited for, so the next one is proposed against a cluster that has settled.
+for v in c1 c2 c3 c4 c5; do
+  tries=0
+  while [ "$tries" -lt 25 ]; do
+    for k in 1 2 3; do
+      printf 'PROP %s\n' "$v" | nc -w 1 127.0.0.1 "$((BASE + 9 + k))" >/dev/null 2>&1 || true
+    done
+    j=0
+    while [ "$j" -lt 20 ]; do
+      case "$(chaos_commands_of 1)$(chaos_commands_of 2)$(chaos_commands_of 3)" in
+        *"$v"*) break ;;
+      esac
+      sleep 0.1
+      j=$((j + 1))
+    done
+    case "$(chaos_commands_of 1)$(chaos_commands_of 2)$(chaos_commands_of 3)" in
+      *"$v"*) break ;;
+    esac
+    tries=$((tries + 1))
+  done
+done
+
+# Let replication catch up on whatever the last round dropped.
+i=0
+while [ "$i" -lt 150 ]; do
+  a=$(chaos_commands_of 1); b=$(chaos_commands_of 2); c=$(chaos_commands_of 3)
+  [ "$a" = "$b" ] && [ "$b" = "$c" ] && case "$a" in *c5*) break ;; esac
+  sleep 0.1
+  i=$((i + 1))
+done
+
+a=$(chaos_commands_of 1); b=$(chaos_commands_of 2); c=$(chaos_commands_of 3)
+if [ "$a" = "$b" ] && [ "$b" = "$c" ]; then
+  ok "all three nodes agree on the same sequence under chaos"
+else
+  bad "the nodes disagree under chaos"
+  echo "  node 1: $a"; echo "  node 2: $b"; echo "  node 3: $c"
+fi
+
+missing=""
+for v in c1 c2 c3 c4 c5; do
+  case "$a" in *"$v"*) ;; *) missing="$missing $v" ;; esac
+done
+if [ -z "$missing" ]; then
+  ok "every command that was accepted came through (c1..c5)"
+else
+  bad "commands never arrived:$missing  (sequence: $a)"
+fi
+
+# First occurrences in the order they were proposed. A duplicate later on is
+# allowed; a reordering is not, because that is the one thing the log decides.
+firsts=$(printf '%s\n' $a | awk '!seen[$0]++' | tr '\n' ' ')
+if [ "$firsts" = "c1 c2 c3 c4 c5 " ]; then
+  ok "and in the order they were proposed"
+else
+  bad "first occurrences are out of order: $firsts"
+fi
+
+# The invariant that matters, now against an adversarial transport.
+cdupes=$(grep -h 'became leader for term' "$CH"/c*.log \
+         | sed -n 's/.*term \([0-9]*\) .*/\1/p' | sort | uniq -d | tr '\n' ' ')
+if [ -z "$cdupes" ]; then
+  ok "no term had two leaders under chaos either"
+else
+  bad "two leaders under chaos in term(s): $cdupes"
+fi
+
+cconf=$( sed -n 's/^node [0-9]*: applied \([0-9]*\) term=\([0-9]*\) cmd=\(.*\)$/\1 \2 \3/p' \
+           "$CH"/c*.log 2>/dev/null | sort -u \
+         | awk '{ idx = $1; $1 = ""; if (idx in seen && seen[idx] != $0)
+                    print "index" idx ":" seen[idx] " vs" $0; seen[idx] = $0 }' )
+if [ -z "$cconf" ]; then
+  ok "and no index was applied with two different commands"
+else
+  bad "chaos produced disagreement: $cconf"
+fi
+
+for i in 1 2 3; do kill -9 "$(cat "$CH/c$i.pid")" 2>/dev/null || true; done
+
+# --- 10. the invariants, over the whole run ---------------------------------
 dupes=$(grep -h 'became leader for term' "$TMP"/n*.log \
         | sed -n 's/.*term \([0-9]*\) .*/\1/p' | sort | uniq -d | tr '\n' ' ')
 if [ -z "$dupes" ]; then

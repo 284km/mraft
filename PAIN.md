@@ -249,6 +249,27 @@ means writing a small distributed system to test it with, and that one has bugs 
   every arm is handled. This is what an ML-family language is for and it has cost
   nothing.
 
+## P8 — a client cannot find out whether its command was committed
+
+`PROP <command>` gets no reply. The leader prints `accepted 4` and later
+`applied 4`, and the client — which has already closed its connection — learns
+neither. Under `--chaos 45` this stops being cosmetic: a command can be accepted by
+a leader that dies before replicating it, and a later leader legitimately discards
+it. Safety is intact, nothing was ever committed, and **the client has no way to
+tell that from success**.
+
+Raft's answer is that the leader replies after the entry commits, and that a client
+carries an id and a sequence number so a retry after a lost reply is recognised
+rather than applied twice. That is the difference between "the cluster agrees on an
+order" — which this program does — and "my write landed exactly once", which it
+cannot say anything about.
+
+**Status:** open, and the honest next slice. It is also the thing that makes the
+chaos test's checks what they are: agreement, presence, and first-occurrence order,
+rather than exact equality.
+
+---
+
 ## What M2 confirmed about the shape
 
 The `(state, event) -> state` actor came out of M1's timing problem, and M2 is
@@ -262,6 +283,26 @@ The test that matters most is the one no single node can perform: **no index was
 ever applied with two different commands**, checked across all three logs after
 the fact. A distributed property does not exist inside any of the processes, so it
 cannot be asserted from inside one.
+
+---
+
+## What M4 measured
+
+`--chaos <pct>` gives each outbound peer message an independent chance of being
+dropped, of being duplicated, and of being held back to travel behind the next one.
+Client connections are untouched, so a proposal that is accepted was really
+accepted; it is the consensus traffic that misbehaves.
+
+TCP over loopback hands over none of these, which is why a protocol that only ran
+there had never been asked the question. At **25%** the cluster elects a leader,
+commits every command offered to it, and all three nodes agree on the same order —
+that phase is in `verify.sh`. At **45%**, run by hand three times: safety held every
+time (no term with two leaders, no index with two different commands) while liveness
+degraded exactly as it should — one round committed all four commands, another two.
+
+The three faults live in the sender thread, because that is the only place a message
+can be interfered with without the rest of the program being able to tell. A fault
+injector the program can detect is not testing anything.
 
 ---
 
